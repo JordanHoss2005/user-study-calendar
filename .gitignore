@@ -1,0 +1,45 @@
+# Sensitive files
+credentials.json
+token.json
+.env
+
+# Database files
+*.db
+study.db
+
+# Temporary files
+ngrok.exe
+ngrok.zip
+*.zip
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Deployment
+deployment/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
+
+# Logs
+*.log
