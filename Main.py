@@ -408,13 +408,22 @@ def google_login():
     # Create Google OAuth flow
     try:
         if GOOGLE_CREDENTIALS_JSON:
-            import json
-            client_config = json.loads(GOOGLE_CREDENTIALS_JSON)
-            flow = Flow.from_client_config(
-                client_config,
-                scopes=admin_scopes,
-                redirect_uri=f"{HOST_BASE}/oauth2callback",
-            )
+            try:
+                import json
+                client_config = json.loads(GOOGLE_CREDENTIALS_JSON)
+                flow = Flow.from_client_config(
+                    client_config,
+                    scopes=admin_scopes,
+                    redirect_uri=f"{HOST_BASE}/oauth2callback",
+                )
+            except json.JSONDecodeError as json_err:
+                print(f"[OAUTH WARNING] Invalid JSON in GOOGLE_CLIENT_SECRETS_JSON: {json_err}")
+                print(f"[OAUTH INFO] Falling back to credentials file: {OAUTH_CLIENT_JSON}")
+                flow = Flow.from_client_secrets_file(
+                    OAUTH_CLIENT_JSON,
+                    scopes=admin_scopes,
+                    redirect_uri=f"{HOST_BASE}/oauth2callback",
+                )
         else:
             flow = Flow.from_client_secrets_file(
                 OAUTH_CLIENT_JSON,
@@ -477,13 +486,22 @@ def google_auth():
 
     try:
         if GOOGLE_CREDENTIALS_JSON:
-            import json
-            client_config = json.loads(GOOGLE_CREDENTIALS_JSON)
-            flow = Flow.from_client_config(
-                client_config,
-                scopes=SCOPES,
-                redirect_uri=f"{HOST_BASE}/oauth2callback",
-            )
+            try:
+                import json
+                client_config = json.loads(GOOGLE_CREDENTIALS_JSON)
+                flow = Flow.from_client_config(
+                    client_config,
+                    scopes=SCOPES,
+                    redirect_uri=f"{HOST_BASE}/oauth2callback",
+                )
+            except json.JSONDecodeError as json_err:
+                print(f"[OAUTH WARNING] Invalid JSON in GOOGLE_CLIENT_SECRETS_JSON: {json_err}")
+                print(f"[OAUTH INFO] Falling back to credentials file: {OAUTH_CLIENT_JSON}")
+                flow = Flow.from_client_secrets_file(
+                    OAUTH_CLIENT_JSON,
+                    scopes=SCOPES,
+                    redirect_uri=f"{HOST_BASE}/oauth2callback",
+                )
         else:
             flow = Flow.from_client_secrets_file(
                 OAUTH_CLIENT_JSON,
@@ -525,13 +543,22 @@ def oauth2callback():
 
         try:
             if GOOGLE_CREDENTIALS_JSON:
-                import json
-                client_config = json.loads(GOOGLE_CREDENTIALS_JSON)
-                flow = Flow.from_client_config(
-                    client_config,
-                    scopes=scopes,
-                    redirect_uri=f"{HOST_BASE}/oauth2callback",
-                )
+                try:
+                    import json
+                    client_config = json.loads(GOOGLE_CREDENTIALS_JSON)
+                    flow = Flow.from_client_config(
+                        client_config,
+                        scopes=scopes,
+                        redirect_uri=f"{HOST_BASE}/oauth2callback",
+                    )
+                except json.JSONDecodeError as json_err:
+                    print(f"[OAUTH WARNING] Invalid JSON in GOOGLE_CLIENT_SECRETS_JSON: {json_err}")
+                    print(f"[OAUTH INFO] Falling back to credentials file: {OAUTH_CLIENT_JSON}")
+                    flow = Flow.from_client_secrets_file(
+                        OAUTH_CLIENT_JSON,
+                        scopes=scopes,
+                        redirect_uri=f"{HOST_BASE}/oauth2callback",
+                    )
             else:
                 flow = Flow.from_client_secrets_file(
                     OAUTH_CLIENT_JSON,
