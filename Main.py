@@ -598,7 +598,6 @@ def logout():
     return redirect(url_for('login'))
 
 @app.get("/reset-auth")
-@require_auth
 def reset_auth():
     """Reset Google authentication to force re-authentication with all scopes"""
     # Delete token file to force re-authentication
@@ -606,13 +605,72 @@ def reset_auth():
         os.remove(TOKEN_JSON)
         print("[RESET AUTH] Deleted token file")
 
+    # Clear any environment token data
+    if "GOOGLE_TOKEN_JSON" in os.environ:
+        os.environ.pop("GOOGLE_TOKEN_JSON", None)
+        print("[RESET AUTH] Cleared environment token")
+
     # Clear any cached credentials and session data
-    session.pop('oauth_state', None)
-    session.pop('auth_type', None)
+    session.clear()
+    print("[RESET AUTH] Cleared all session data")
 
     # Force logout and re-login with Google to get fresh scopes
-    session.clear()
     return redirect(url_for('google_login'))
+
+@app.get("/force-gmail-auth")
+def force_gmail_auth():
+    """Force Gmail authentication with explicit scope"""
+    # Clear everything first
+    if os.path.exists(TOKEN_JSON):
+        os.remove(TOKEN_JSON)
+    session.clear()
+
+    # Explicit Gmail + Calendar scopes
+    gmail_scopes = [
+        "https://www.googleapis.com/auth/calendar",
+        "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+        "openid"
+    ]
+
+    print(f"[FORCE GMAIL AUTH] Requesting scopes: {gmail_scopes}")
+
+    try:
+        if GOOGLE_CREDENTIALS_JSON:
+            try:
+                import json
+                client_config = json.loads(GOOGLE_CREDENTIALS_JSON)
+                flow = Flow.from_client_config(
+                    client_config,
+                    scopes=gmail_scopes,
+                    redirect_uri=f"{HOST_BASE}/oauth2callback",
+                )
+            except json.JSONDecodeError:
+                flow = Flow.from_client_secrets_file(
+                    OAUTH_CLIENT_JSON,
+                    scopes=gmail_scopes,
+                    redirect_uri=f"{HOST_BASE}/oauth2callback",
+                )
+        else:
+            flow = Flow.from_client_secrets_file(
+                OAUTH_CLIENT_JSON,
+                scopes=gmail_scopes,
+                redirect_uri=f"{HOST_BASE}/oauth2callback",
+            )
+
+        auth_url, state = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="false",
+            prompt="consent",
+        )
+
+        session['oauth_state'] = state
+        session['auth_type'] = 'admin'
+        return redirect(auth_url)
+
+    except Exception as e:
+        return f"Error setting up Gmail authentication: {str(e)}", 500
 
 @app.get("/")
 def index():
@@ -928,7 +986,7 @@ ADMIN_HTML = """
       <span class="success">📧 Gmail Ready</span>
     {% else %}
       <span class="warn">❌ Gmail Not Ready</span>
-      <a href="/reset-auth" class="btn" style="margin-left: 10px; padding: 6px 12px; font-size: 14px;">Grant Gmail Permissions</a>
+      <a href="/force-gmail-auth" class="btn" style="margin-left: 10px; padding: 6px 12px; font-size: 14px;">Fix Gmail Permissions</a>
     {% endif %}
   </div>
 </div>
