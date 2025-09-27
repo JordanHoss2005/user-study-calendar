@@ -163,20 +163,34 @@ User Study Booking System
         return "DRY-RUN: No SMTP configured"
 
     try:
+        print(f"[CONFIRMATION EMAIL] Attempting to send confirmation to {to_email}")
         msg = EmailMessage()
         msg["From"] = SMTP_FROM
         msg["To"] = f"{to_name} <{to_email}>"
         msg["Subject"] = "✅ User Study Booking CONFIRMED - Calendar Invite Coming Soon"
         msg.set_content(body)
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            print(f"[CONFIRMATION EMAIL] Connected to SMTP server")
             s.starttls()
+            print(f"[CONFIRMATION EMAIL] STARTTLS enabled")
             s.login(SMTP_USER, SMTP_PASS)
+            print(f"[CONFIRMATION EMAIL] Logged in successfully")
             s.send_message(msg)
+            print(f"[CONFIRMATION EMAIL] Confirmation email sent successfully to {to_email}")
         return "SUCCESS"
+    except smtplib.SMTPAuthenticationError as e:
+        error_msg = f"SMTP Authentication failed: {str(e)}"
+        print(f"[CONFIRMATION EMAIL ERROR] {error_msg}")
+        return f"ERROR: {error_msg}"
+    except smtplib.SMTPException as e:
+        error_msg = f"SMTP error: {str(e)}"
+        print(f"[CONFIRMATION EMAIL ERROR] {error_msg}")
+        return f"ERROR: {error_msg}"
     except Exception as e:
-        print(f"[CONFIRMATION EMAIL ERROR] {e}")
-        return f"ERROR: {str(e)}"
+        error_msg = f"General error: {str(e)}"
+        print(f"[CONFIRMATION EMAIL ERROR] {error_msg}")
+        return f"ERROR: {error_msg}"
 
 # Simple username/password authentication
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
@@ -317,20 +331,35 @@ User Study Booking System
         return "DRY-RUN: No SMTP configured"
 
     try:
+        print(f"[EMAIL] Attempting to send email to {to_email}")
         msg = EmailMessage()
         msg["From"] = SMTP_FROM
         msg["To"] = f"{to_name} <{to_email}>"
         msg["Subject"] = "📅 User Study Invitation - Pick Your Time Slot"
         msg.set_content(enhanced_body)
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+        # Add timeout and better error handling
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            print(f"[EMAIL] Connected to SMTP server {SMTP_HOST}")
             s.starttls()
+            print(f"[EMAIL] STARTTLS enabled")
             s.login(SMTP_USER, SMTP_PASS)
+            print(f"[EMAIL] Logged in as {SMTP_USER}")
             s.send_message(msg)
+            print(f"[EMAIL] Email sent successfully to {to_email}")
         return "SUCCESS"
+    except smtplib.SMTPAuthenticationError as e:
+        error_msg = f"SMTP Authentication failed: {str(e)}"
+        print(f"[EMAIL ERROR] {error_msg}")
+        return f"ERROR: {error_msg}"
+    except smtplib.SMTPException as e:
+        error_msg = f"SMTP error: {str(e)}"
+        print(f"[EMAIL ERROR] {error_msg}")
+        return f"ERROR: {error_msg}"
     except Exception as e:
-        print(f"[EMAIL ERROR] {e}")
-        return f"ERROR: {str(e)}"
+        error_msg = f"General error: {str(e)}"
+        print(f"[EMAIL ERROR] {error_msg}")
+        return f"ERROR: {error_msg}"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Authentication Routes
