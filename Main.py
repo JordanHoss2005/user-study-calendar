@@ -453,12 +453,15 @@ User Study Booking System
 
     # BACKUP: Simple email logging that always works
     print(f"[EMAIL FALLBACK] Logging email for manual sending")
+    # Remove emojis for Windows console compatibility
+    clean_subject = subject.encode('ascii', 'ignore').decode('ascii')
+    clean_body = enhanced_body.encode('ascii', 'ignore').decode('ascii')
     print(f"""
 === EMAIL TO SEND MANUALLY ===
 To: {to_name} <{to_email}>
-Subject: {subject}
+Subject: {clean_subject}
 
-{enhanced_body}
+{clean_body}
 
 Booking Link: {link}
 ===============================
