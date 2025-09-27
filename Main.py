@@ -552,6 +552,7 @@ def google_login():
     ]
 
     # Create Google OAuth flow
+    print(f"[OAUTH] Requesting scopes: {admin_scopes}")
     try:
         if GOOGLE_CREDENTIALS_JSON:
             try:
@@ -582,7 +583,7 @@ def google_login():
 
     auth_url, state = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",
+        include_granted_scopes="false",  # Force fresh scope request
         prompt="consent",
     )
 
@@ -605,10 +606,12 @@ def reset_auth():
         os.remove(TOKEN_JSON)
         print("[RESET AUTH] Deleted token file")
 
-    # Clear any cached credentials
+    # Clear any cached credentials and session data
     session.pop('oauth_state', None)
     session.pop('auth_type', None)
 
+    # Force logout and re-login with Google to get fresh scopes
+    session.clear()
     return redirect(url_for('google_login'))
 
 @app.get("/")
@@ -794,6 +797,7 @@ def oauth2callback():
 
         # Save calendar credentials
         save_creds(creds)
+        print(f"[OAUTH SUCCESS] Saved credentials with scopes: {creds.scopes}")
 
         # Clean up OAuth session data
         session.pop('oauth_state', None)
