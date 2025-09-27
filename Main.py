@@ -896,6 +896,14 @@ ADMIN_HTML = """
       <a href="/google-auth" class="btn" style="margin-left: 10px; padding: 6px 12px; font-size: 14px;">Connect Now</a>
     {% endif %}
   </div>
+  <div class="status-item">
+    {% if gmail_ready %}
+      <span class="success">📧 Gmail Ready</span>
+    {% else %}
+      <span class="warn">❌ Gmail Not Ready</span>
+      <a href="/google-login" class="btn" style="margin-left: 10px; padding: 6px 12px; font-size: 14px;">Grant Gmail Permissions</a>
+    {% endif %}
+  </div>
 </div>
 
 {% if success %}
@@ -987,6 +995,17 @@ ADMIN_HTML = """
 @require_auth
 def admin():
     authed = have_token()
+
+    # Check if we need Gmail permissions
+    gmail_ready = False
+    if authed:
+        try:
+            creds = get_creds()
+            if creds and creds.valid and creds.scopes:
+                gmail_ready = 'https://www.googleapis.com/auth/gmail.send' in creds.scopes
+        except:
+            pass
+
     msg = request.args.get("msg", "")
     success = ""
     if msg == "email_saved":
@@ -1022,6 +1041,7 @@ def admin():
         title=APP_TITLE,
         cal_id=CALENDAR_ID or "(missing)",
         authed=authed,
+        gmail_ready=gmail_ready,
         email_body=get_setting("email_body"),
         consent_html=get_setting("consent_html"),
         consent_files=get_consent_files(),
