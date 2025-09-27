@@ -178,7 +178,9 @@ User Study Booking System
         print(f"[CONFIRMATION EMAIL ERROR] {e}")
         return f"ERROR: {str(e)}"
 
-# Simple Google OAuth authentication - no organization restrictions
+# Simple username/password authentication
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "password123")
 
 def update_env_with_user_email(user_email):
     """Update .env file with user's email for SMTP"""
@@ -349,19 +351,23 @@ LOGIN_HTML = """
    box-shadow: 0 20px 40px rgba(0,0,0,0.1); text-align: center;
  }
  h1 { margin: 0 0 30px; color: #2d3748; }
- .google-btn {
-   display: flex; align-items: center; justify-content: center; gap: 12px;
-   width: 100%; background: white; border: 2px solid #e2e8f0; border-radius: 10px;
-   padding: 12px 24px; font-size: 16px; font-weight: 600; color: #2d3748;
-   text-decoration: none; transition: all 0.2s; margin: 20px 0;
+ .form-group { margin: 20px 0; text-align: left; }
+ label { display: block; margin-bottom: 8px; color: #4a5568; font-weight: 600; }
+ input[type="text"], input[type="password"] {
+   width: 100%; padding: 12px 16px; border: 2px solid #e2e8f0; border-radius: 10px;
+   font-size: 16px; transition: all 0.2s; font-family: inherit;
  }
- .google-btn:hover {
-   border-color: #4285f4; box-shadow: 0 4px 12px rgba(66, 133, 244, 0.2);
-   transform: translateY(-2px);
+ input[type="text"]:focus, input[type="password"]:focus {
+   outline: none; border-color: #667eea; box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
  }
- .google-icon {
-   width: 20px; height: 20px;
-   background: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="%234285f4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="%2334a853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="%23fbbc05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="%23ea4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>') center/contain no-repeat;
+ .login-btn {
+   width: 100%; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+   color: white; border: none; padding: 12px 24px; border-radius: 10px;
+   cursor: pointer; font-weight: 600; font-size: 16px; transition: all 0.2s;
+   font-family: inherit; margin: 20px 0;
+ }
+ .login-btn:hover {
+   transform: translateY(-2px); box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
  }
  .error { background: #fed7d7; color: #9b2c2c; padding: 15px; border-radius: 10px; margin: 15px 0; }
  .note { color: #718096; font-size: 14px; margin-top: 20px; line-height: 1.4; }
@@ -373,24 +379,43 @@ LOGIN_HTML = """
   <div class="error">❌ {{error}}</div>
   {% endif %}
 
-  <p style="color: #4a5568; margin-bottom: 30px;">Sign in with your Google account to access the admin panel</p>
+  <form method="post" action="/login">
+    <div class="form-group">
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" required>
+    </div>
 
-  <a href="/google-login" class="google-btn">
-    <div class="google-icon"></div>
-    Sign in with Google
-  </a>
+    <div class="form-group">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" required>
+    </div>
+
+    <button type="submit" class="login-btn">Sign In</button>
+  </form>
 
   <div class="note">
-    <strong>Secure Google Authentication</strong><br>
-    Your Google account will be used for both admin access and sending emails.<br>
-    <em>Calendar permissions will be requested after login.</em>
+    <strong>Admin Access</strong><br>
+    Use your admin credentials to access the calendar booking system.
   </div>
 </div>
 """
 
-@app.route("/login", methods=["GET"])
+@app.route("/login", methods=["GET", "POST"])
 def login():
     error = ""
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "").strip()
+
+        if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+            session['authenticated'] = True
+            session['user_email'] = SMTP_USER  # Use the configured email
+            session['user_name'] = "Admin"
+            session['user_org'] = "Admin"
+            return redirect(url_for('admin'))
+        else:
+            error = "Invalid username or password."
+
     if request.args.get('error') == 'auth_failed':
         error = "Authentication failed. Please try again."
     return render_template_string(LOGIN_HTML, title=APP_TITLE, error=error)
