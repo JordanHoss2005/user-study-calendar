@@ -243,19 +243,33 @@ def have_token():
     return os.path.exists(TOKEN_JSON)
 
 def get_creds():
+    print(f"[GET_CREDS] Checking for credentials...")
+
     # Try to get token from environment first
     token_data = os.getenv("GOOGLE_TOKEN_JSON", "")
     if token_data:
         try:
             import json
             token_info = json.loads(token_data)
-            return Credentials.from_authorized_user_info(token_info, SCOPES)
-        except:
+            print(f"[GET_CREDS] Found environment token with scopes: {token_info.get('scopes', 'NONE')}")
+            # Don't use SCOPES constant, use the scopes from the saved token
+            creds = Credentials.from_authorized_user_info(token_info)
+            return creds
+        except Exception as e:
+            print(f"[GET_CREDS] Environment token error: {e}")
             pass
 
     # Fallback to file
     if os.path.exists(TOKEN_JSON):
-        return Credentials.from_authorized_user_file(TOKEN_JSON, SCOPES)
+        print(f"[GET_CREDS] Found token file")
+        try:
+            creds = Credentials.from_authorized_user_file(TOKEN_JSON)
+            print(f"[GET_CREDS] File token scopes: {creds.scopes}")
+            return creds
+        except Exception as e:
+            print(f"[GET_CREDS] File token error: {e}")
+
+    print(f"[GET_CREDS] No valid credentials found")
     return None
 
 def save_creds(creds: Credentials):
@@ -617,13 +631,30 @@ def reset_auth():
     # Force logout and re-login with Google to get fresh scopes
     return redirect(url_for('google_login'))
 
+@app.get("/clear-env-token")
+def clear_env_token():
+    """Clear environment token to force file-based token"""
+    if "GOOGLE_TOKEN_JSON" in os.environ:
+        del os.environ["GOOGLE_TOKEN_JSON"]
+        print("[CLEAR ENV] Removed GOOGLE_TOKEN_JSON from environment")
+        return "Environment token cleared. <a href='/debug'>Check debug</a> | <a href='/admin'>Go to admin</a>"
+    else:
+        return "No environment token found. <a href='/debug'>Check debug</a> | <a href='/admin'>Go to admin</a>"
+
 @app.get("/force-gmail-auth")
 def force_gmail_auth():
     """Force Gmail authentication with explicit scope"""
-    # Clear everything first
+    # Clear everything first - file, environment, and session
     if os.path.exists(TOKEN_JSON):
         os.remove(TOKEN_JSON)
+        print("[FORCE GMAIL AUTH] Deleted token file")
+
+    if "GOOGLE_TOKEN_JSON" in os.environ:
+        del os.environ["GOOGLE_TOKEN_JSON"]
+        print("[FORCE GMAIL AUTH] Cleared environment token")
+
     session.clear()
+    print("[FORCE GMAIL AUTH] Cleared session")
 
     # Explicit Gmail + Calendar scopes
     gmail_scopes = [
