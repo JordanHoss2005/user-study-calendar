@@ -382,13 +382,16 @@ User Study Booking System
     subject = "📅 User Study Invitation - Pick Your Time Slot"
 
     # Try Gmail API first, fallback to SMTP
+    print(f"[EMAIL] Attempting Gmail API first for {to_email}")
     result = send_email_with_gmail_api(to_email, to_name, subject, enhanced_body)
+    print(f"[EMAIL] Gmail API result: {result}")
 
     if result == "SUCCESS":
         return result
 
     # Fallback to SMTP if Gmail API fails
-    print(f"[EMAIL] Gmail API failed, trying SMTP fallback...")
+    print(f"[EMAIL] Gmail API failed with: {result}")
+    print(f"[EMAIL] Trying SMTP fallback...")
 
     if not SMTP_HOST:
         print(f"[DRY-RUN EMAIL] To: {to_name} <{to_email}>\n{enhanced_body}\n")
@@ -610,6 +613,18 @@ def debug():
         "OAUTH_CLIENT_JSON": "EXISTS" if os.path.exists(OAUTH_CLIENT_JSON) else "MISSING",
         "TOKEN_JSON": "EXISTS" if os.path.exists(TOKEN_JSON) else "MISSING"
     }
+
+    # Check current credentials
+    try:
+        creds = get_creds()
+        if creds:
+            debug_info["CREDENTIALS_VALID"] = "YES" if creds.valid else "NO (expired)"
+            debug_info["CREDENTIALS_SCOPES"] = ", ".join(creds.scopes) if creds.scopes else "NONE"
+            debug_info["HAS_GMAIL_SCOPE"] = "YES" if creds.scopes and 'https://www.googleapis.com/auth/gmail.send' in creds.scopes else "NO"
+        else:
+            debug_info["CREDENTIALS_VALID"] = "NO CREDENTIALS"
+    except Exception as e:
+        debug_info["CREDENTIALS_ERROR"] = str(e)
 
     return f"""
     <h2>Debug Information</h2>
@@ -1143,9 +1158,13 @@ def admin_participant():
     # Send initial email (with network error handling)
     email_result = send_initial_email(email, name, link)
 
-    # If network is unreachable, still show success but note email issue
+    # Handle different types of email errors
     if "Network is unreachable" in email_result or "Errno 101" in email_result:
         email_result = "NETWORK_ERROR: Email server unreachable. Participant created successfully."
+    elif "Gmail API credentials not available" in email_result:
+        email_result = "AUTH_ERROR: Please sign in with Google to enable email sending."
+    elif "Gmail send permission not granted" in email_result:
+        email_result = "SCOPE_ERROR: Please re-authenticate with Google and grant Gmail permissions."
 
     # Show detailed receipt page with email status
     receipt_html = f"""
@@ -1171,6 +1190,10 @@ def admin_participant():
         receipt_html += '<div class="success">📧 Email sent successfully!</div>'
     elif "NETWORK_ERROR" in email_result:
         receipt_html += '<div class="error">⚠️ Network issue: Email server unreachable. Participant created successfully - please send the booking link manually.</div>'
+    elif "AUTH_ERROR" in email_result:
+        receipt_html += '<div class="error">🔐 Authentication needed: Please <a href="/logout">sign out</a> and <a href="/google-login">sign in with Google</a> to enable email sending.</div>'
+    elif "SCOPE_ERROR" in email_result:
+        receipt_html += '<div class="error">📧 Permission needed: Please <a href="/logout">sign out</a> and <a href="/google-login">re-authenticate with Google</a> granting Gmail permissions.</div>'
     elif "EMAIL_SKIPPED" in email_result:
         receipt_html += '<div class="success">✅ Participant added! Send the booking link manually or copy from console.</div>'
     elif "DRY-RUN" in email_result:
