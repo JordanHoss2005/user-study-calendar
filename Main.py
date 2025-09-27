@@ -321,8 +321,8 @@ def send_email_with_gmail_api(to_email, to_name, subject, body):
             return "ERROR: Gmail API credentials not available - please sign in with Google"
 
         # Check if we have Gmail scope
-        if creds.scopes and 'https://www.googleapis.com/auth/gmail.send' not in creds.scopes:
-            print("[GMAIL API] Missing Gmail send scope")
+        if not creds.scopes or 'https://www.googleapis.com/auth/gmail.send' not in creds.scopes:
+            print(f"[GMAIL API] Missing Gmail send scope. Current scopes: {creds.scopes}")
             return "ERROR: Gmail send permission not granted - please re-authenticate with Google"
 
         # Build Gmail service
@@ -595,6 +595,21 @@ def google_login():
 def logout():
     session.clear()
     return redirect(url_for('login'))
+
+@app.get("/reset-auth")
+@require_auth
+def reset_auth():
+    """Reset Google authentication to force re-authentication with all scopes"""
+    # Delete token file to force re-authentication
+    if os.path.exists(TOKEN_JSON):
+        os.remove(TOKEN_JSON)
+        print("[RESET AUTH] Deleted token file")
+
+    # Clear any cached credentials
+    session.pop('oauth_state', None)
+    session.pop('auth_type', None)
+
+    return redirect(url_for('google_login'))
 
 @app.get("/")
 def index():
@@ -901,7 +916,7 @@ ADMIN_HTML = """
       <span class="success">📧 Gmail Ready</span>
     {% else %}
       <span class="warn">❌ Gmail Not Ready</span>
-      <a href="/google-login" class="btn" style="margin-left: 10px; padding: 6px 12px; font-size: 14px;">Grant Gmail Permissions</a>
+      <a href="/reset-auth" class="btn" style="margin-left: 10px; padding: 6px 12px; font-size: 14px;">Grant Gmail Permissions</a>
     {% endif %}
   </div>
 </div>
