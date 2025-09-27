@@ -641,10 +641,18 @@ def debug():
     except Exception as e:
         debug_info["CREDENTIALS_ERROR"] = str(e)
 
+    # Test Gmail API
+    try:
+        result = send_email_with_gmail_api("test@example.com", "Test User", "Test Subject", "Test Body")
+        debug_info["GMAIL_TEST"] = result
+    except Exception as e:
+        debug_info["GMAIL_TEST_ERROR"] = str(e)
+
     return f"""
     <h2>Debug Information</h2>
     <pre>{chr(10).join(f"{k}: {v}" for k, v in debug_info.items())}</pre>
     <p><a href="/login">Go to Login</a></p>
+    <p><a href="/admin">Go to Admin</a></p>
     """
 
 # ──────────────────────────────────────────────────────────────────────────────
