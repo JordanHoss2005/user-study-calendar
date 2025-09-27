@@ -365,9 +365,14 @@ def send_email_with_gmail_api(to_email, to_name, subject, body):
 
     except Exception as e:
         import traceback
-        error_msg = f"Gmail API error: {str(e)}"
+        error_str = str(e)
+        if not error_str.strip():
+            error_str = f"Empty error from {type(e).__name__}"
+        error_msg = f"Gmail API error: {error_str}"
         full_traceback = traceback.format_exc()
         print(f"[GMAIL API ERROR] {error_msg}")
+        print(f"[GMAIL API ERROR TYPE] {type(e)}")
+        print(f"[GMAIL API ERROR ARGS] {e.args}")
         print(f"[GMAIL API ERROR TRACEBACK] {full_traceback}")
         return f"ERROR: {error_msg}"
 
@@ -741,9 +746,26 @@ def debug():
     # Test Gmail API with your own email
     try:
         test_email = session.get('user_email', 'mo.amin797@gmail.com')  # Use actual email
-        result = send_email_with_gmail_api(test_email, "Test User", "Test Subject", "Test Body")
-        debug_info["GMAIL_TEST"] = result
         debug_info["GMAIL_TEST_EMAIL"] = test_email
+
+        # Test Gmail service creation first
+        try:
+            creds = get_creds()
+            service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+            debug_info["GMAIL_SERVICE"] = "OK"
+
+            # Test simple API call
+            profile = service.users().getProfile(userId='me').execute()
+            debug_info["GMAIL_PROFILE"] = f"Email: {profile.get('emailAddress', 'NONE')}"
+
+            # Now test actual email sending
+            result = send_email_with_gmail_api(test_email, "Test User", "Test Subject", "Test Body")
+            debug_info["GMAIL_TEST"] = result
+
+        except Exception as service_error:
+            debug_info["GMAIL_SERVICE_ERROR"] = str(service_error)
+            debug_info["GMAIL_TEST"] = f"Service creation failed: {str(service_error)}"
+
     except Exception as e:
         debug_info["GMAIL_TEST_ERROR"] = str(e)
 
