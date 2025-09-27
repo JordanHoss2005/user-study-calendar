@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-import os, sqlite3, secrets, smtplib
+import os, sqlite3, secrets, smtplib, base64
 from email.message import EmailMessage
+from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
@@ -158,16 +159,27 @@ The Research Team
 User Study Booking System
 """
 
+    subject = "✅ User Study Booking CONFIRMED - Calendar Invite Coming Soon"
+
+    # Try Gmail API first, fallback to SMTP
+    result = send_email_with_gmail_api(to_email, to_name, subject, body)
+
+    if result == "SUCCESS":
+        return result
+
+    # Fallback to SMTP if Gmail API fails
+    print(f"[CONFIRMATION EMAIL] Gmail API failed, trying SMTP fallback...")
+
     if not SMTP_HOST:
         print(f"[DRY-RUN CONFIRMATION EMAIL] To: {to_name} <{to_email}>\n{body}\n")
         return "DRY-RUN: No SMTP configured"
 
     try:
-        print(f"[CONFIRMATION EMAIL] Attempting to send confirmation to {to_email}")
+        print(f"[CONFIRMATION EMAIL] Attempting to send confirmation via SMTP to {to_email}")
         msg = EmailMessage()
         msg["From"] = SMTP_FROM
         msg["To"] = f"{to_name} <{to_email}>"
-        msg["Subject"] = "✅ User Study Booking CONFIRMED - Calendar Invite Coming Soon"
+        msg["Subject"] = subject
         msg.set_content(body)
 
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
@@ -299,6 +311,41 @@ def is_free(service, start_local: datetime, end_local: datetime):
             return False
     return True
 
+def send_email_with_gmail_api(to_email, to_name, subject, body):
+    """Send email using Gmail API instead of SMTP"""
+    try:
+        # Get credentials for Gmail API
+        creds = get_creds()
+        if not creds or not creds.valid:
+            return "ERROR: Gmail API credentials not available"
+
+        # Build Gmail service
+        service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+        # Create message
+        message = MIMEText(body)
+        message['to'] = f"{to_name} <{to_email}>"
+        message['from'] = SMTP_FROM
+        message['subject'] = subject
+
+        # Encode message
+        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+        # Send email
+        print(f"[GMAIL API] Attempting to send email to {to_email}")
+        result = service.users().messages().send(
+            userId='me',
+            body={'raw': raw_message}
+        ).execute()
+
+        print(f"[GMAIL API] Email sent successfully. Message ID: {result.get('id')}")
+        return "SUCCESS"
+
+    except Exception as e:
+        error_msg = f"Gmail API error: {str(e)}"
+        print(f"[GMAIL API ERROR] {error_msg}")
+        return f"ERROR: {error_msg}"
+
 def send_initial_email(to_email, to_name, link):
     body_tpl = get_setting("email_body")
     body = body_tpl.replace("{{name}}", to_name).replace("{{link}}", link)
@@ -326,16 +373,27 @@ Reply to this email if you need assistance.
 User Study Booking System
 """
 
+    subject = "📅 User Study Invitation - Pick Your Time Slot"
+
+    # Try Gmail API first, fallback to SMTP
+    result = send_email_with_gmail_api(to_email, to_name, subject, enhanced_body)
+
+    if result == "SUCCESS":
+        return result
+
+    # Fallback to SMTP if Gmail API fails
+    print(f"[EMAIL] Gmail API failed, trying SMTP fallback...")
+
     if not SMTP_HOST:
         print(f"[DRY-RUN EMAIL] To: {to_name} <{to_email}>\n{enhanced_body}\n")
         return "DRY-RUN: No SMTP configured"
 
     try:
-        print(f"[EMAIL] Attempting to send email to {to_email}")
+        print(f"[EMAIL] Attempting to send email via SMTP to {to_email}")
         msg = EmailMessage()
         msg["From"] = SMTP_FROM
         msg["To"] = f"{to_name} <{to_email}>"
-        msg["Subject"] = "📅 User Study Invitation - Pick Your Time Slot"
+        msg["Subject"] = subject
         msg.set_content(enhanced_body)
 
         # Add timeout and better error handling
@@ -454,6 +512,7 @@ def google_login():
     # Use the exact scopes that Google returns
     admin_scopes = [
         "https://www.googleapis.com/auth/calendar",
+        "https://www.googleapis.com/auth/gmail.send",
         "https://www.googleapis.com/auth/userinfo.email",
         "https://www.googleapis.com/auth/userinfo.profile",
         "openid"
@@ -588,6 +647,7 @@ def oauth2callback():
         if auth_type == 'admin':
             scopes = [
                 "https://www.googleapis.com/auth/calendar",
+                "https://www.googleapis.com/auth/gmail.send",
                 "https://www.googleapis.com/auth/userinfo.email",
                 "https://www.googleapis.com/auth/userinfo.profile",
                 "openid"
