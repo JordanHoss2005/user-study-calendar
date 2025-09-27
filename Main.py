@@ -1325,8 +1325,16 @@ def invite(token):
 
     # build calendar view for the next 7 days starting today
     today_local = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-    service = calendar_service()
     now_local = datetime.now(TZ)
+
+    # Check if calendar service is available
+    try:
+        service = calendar_service()
+        calendar_available = True
+    except Exception as e:
+        print(f"[CALENDAR ERROR] Calendar service unavailable: {e}")
+        service = None
+        calendar_available = False
 
     # Generate 7 days of calendar data
     calendar_days = []
@@ -1343,6 +1351,10 @@ def invite(token):
             # Determine slot status
             if start <= now_local:
                 status = "past"
+                url = ""
+            elif not calendar_available:
+                # If calendar is not connected, show all future slots as unavailable
+                status = "unavailable"
                 url = ""
             elif is_free(service, start, end):
                 status = "available"
@@ -1367,13 +1379,18 @@ def invite(token):
     end_date = (today_local + timedelta(days=6)).strftime("%b %d").replace(" 0", " ")
     current_week_label = f"{start_date} - {end_date}"
 
+    # Add error message if calendar is not available
+    error_msg = request.args.get("error")
+    if not calendar_available and not error_msg:
+        error_msg = "Calendar system is not connected. All slots are currently unavailable. Please contact the administrator."
+
     return render_template_string(
         INVITE_HTML,
         title=APP_TITLE,
         name=p["name"],
         calendar_days=calendar_days,
         current_week_label=current_week_label,
-        error=request.args.get("error")
+        error=error_msg
     )
 
 @app.get("/book")
