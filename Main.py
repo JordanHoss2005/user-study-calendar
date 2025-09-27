@@ -1050,8 +1050,12 @@ def admin_participant():
     with db() as con:
         con.execute("INSERT INTO participants(name,email,token) VALUES(?,?,?)", (name, email, token))
     link = f"{HOST_BASE}/invite/{token}"
-    # Send initial email
+    # Send initial email (with network error handling)
     email_result = send_initial_email(email, name, link)
+
+    # If network is unreachable, still show success but note email issue
+    if "Network is unreachable" in email_result or "Errno 101" in email_result:
+        email_result = "NETWORK_ERROR: Email server unreachable. Participant created successfully."
 
     # Show detailed receipt page with email status
     receipt_html = f"""
@@ -1075,6 +1079,8 @@ def admin_participant():
 
     if email_result == "SUCCESS":
         receipt_html += '<div class="success">📧 Email sent successfully!</div>'
+    elif "NETWORK_ERROR" in email_result:
+        receipt_html += '<div class="error">⚠️ Network issue: Email server unreachable. Participant created successfully - please send the booking link manually.</div>'
     elif "EMAIL_SKIPPED" in email_result:
         receipt_html += '<div class="success">✅ Participant added! Send the booking link manually or copy from console.</div>'
     elif "DRY-RUN" in email_result:
