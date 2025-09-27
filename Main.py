@@ -406,20 +406,24 @@ def google_login():
     ]
 
     # Create Google OAuth flow
-    if GOOGLE_CREDENTIALS_JSON:
-        import json
-        client_config = json.loads(GOOGLE_CREDENTIALS_JSON)
-        flow = Flow.from_client_config(
-            client_config,
-            scopes=admin_scopes,
-            redirect_uri=f"{HOST_BASE}/oauth2callback",
-        )
-    else:
-        flow = Flow.from_client_secrets_file(
-            OAUTH_CLIENT_JSON,
-            scopes=admin_scopes,
-            redirect_uri=f"{HOST_BASE}/oauth2callback",
-        )
+    try:
+        if GOOGLE_CREDENTIALS_JSON:
+            import json
+            client_config = json.loads(GOOGLE_CREDENTIALS_JSON)
+            flow = Flow.from_client_config(
+                client_config,
+                scopes=admin_scopes,
+                redirect_uri=f"{HOST_BASE}/oauth2callback",
+            )
+        else:
+            flow = Flow.from_client_secrets_file(
+                OAUTH_CLIENT_JSON,
+                scopes=admin_scopes,
+                redirect_uri=f"{HOST_BASE}/oauth2callback",
+            )
+    except Exception as e:
+        print(f"[OAUTH ERROR] Failed to create OAuth flow: {e}")
+        return f"OAuth configuration error: {str(e)}", 500
 
     auth_url, state = flow.authorization_url(
         access_type="offline",
@@ -443,6 +447,24 @@ def index():
         return redirect(url_for('admin'))
     return redirect(url_for('login'))
 
+@app.get("/debug")
+def debug():
+    """Debug endpoint to check configuration"""
+    debug_info = {
+        "HOST_BASE": HOST_BASE,
+        "CALENDAR_ID": CALENDAR_ID[:20] + "..." if CALENDAR_ID else "NOT SET",
+        "SMTP_HOST": SMTP_HOST,
+        "GOOGLE_CREDENTIALS_JSON": "SET" if GOOGLE_CREDENTIALS_JSON else "NOT SET",
+        "OAUTH_CLIENT_JSON": "EXISTS" if os.path.exists(OAUTH_CLIENT_JSON) else "MISSING",
+        "TOKEN_JSON": "EXISTS" if os.path.exists(TOKEN_JSON) else "MISSING"
+    }
+
+    return f"""
+    <h2>Debug Information</h2>
+    <pre>{chr(10).join(f"{k}: {v}" for k, v in debug_info.items())}</pre>
+    <p><a href="/login">Go to Login</a></p>
+    """
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Routes: Google OAuth
 # ──────────────────────────────────────────────────────────────────────────────
@@ -453,20 +475,24 @@ def google_auth():
     user_email = session.get('user_email', '')
     user_domain = user_email.split('@')[-1] if '@' in user_email else 'torontomu.ca'
 
-    if GOOGLE_CREDENTIALS_JSON:
-        import json
-        client_config = json.loads(GOOGLE_CREDENTIALS_JSON)
-        flow = Flow.from_client_config(
-            client_config,
-            scopes=SCOPES,
-            redirect_uri=f"{HOST_BASE}/oauth2callback",
-        )
-    else:
-        flow = Flow.from_client_secrets_file(
-            OAUTH_CLIENT_JSON,
-            scopes=SCOPES,
-            redirect_uri=f"{HOST_BASE}/oauth2callback",
-        )
+    try:
+        if GOOGLE_CREDENTIALS_JSON:
+            import json
+            client_config = json.loads(GOOGLE_CREDENTIALS_JSON)
+            flow = Flow.from_client_config(
+                client_config,
+                scopes=SCOPES,
+                redirect_uri=f"{HOST_BASE}/oauth2callback",
+            )
+        else:
+            flow = Flow.from_client_secrets_file(
+                OAUTH_CLIENT_JSON,
+                scopes=SCOPES,
+                redirect_uri=f"{HOST_BASE}/oauth2callback",
+            )
+    except Exception as e:
+        print(f"[OAUTH ERROR] Failed to create OAuth flow: {e}")
+        return f"OAuth configuration error: {str(e)}", 500
     auth_url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
@@ -497,20 +523,24 @@ def oauth2callback():
         else:
             scopes = SCOPES
 
-        if GOOGLE_CREDENTIALS_JSON:
-            import json
-            client_config = json.loads(GOOGLE_CREDENTIALS_JSON)
-            flow = Flow.from_client_config(
-                client_config,
-                scopes=scopes,
-                redirect_uri=f"{HOST_BASE}/oauth2callback",
-            )
-        else:
-            flow = Flow.from_client_secrets_file(
-                OAUTH_CLIENT_JSON,
-                scopes=scopes,
-                redirect_uri=f"{HOST_BASE}/oauth2callback",
-            )
+        try:
+            if GOOGLE_CREDENTIALS_JSON:
+                import json
+                client_config = json.loads(GOOGLE_CREDENTIALS_JSON)
+                flow = Flow.from_client_config(
+                    client_config,
+                    scopes=scopes,
+                    redirect_uri=f"{HOST_BASE}/oauth2callback",
+                )
+            else:
+                flow = Flow.from_client_secrets_file(
+                    OAUTH_CLIENT_JSON,
+                    scopes=scopes,
+                    redirect_uri=f"{HOST_BASE}/oauth2callback",
+                )
+        except Exception as e:
+            print(f"[OAUTH ERROR] Failed to create OAuth flow: {e}")
+            return redirect(url_for("login") + "?error=oauth_config_failed")
         flow.fetch_token(authorization_response=request.url)
         creds = flow.credentials
 
