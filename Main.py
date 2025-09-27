@@ -353,6 +353,8 @@ def send_email_with_gmail_api(to_email, to_name, subject, body):
 
         # Send email
         print(f"[GMAIL API] Attempting to send email to {to_email}")
+        print(f"[GMAIL API] Message size: {len(raw_message)} chars")
+
         result = service.users().messages().send(
             userId='me',
             body={'raw': raw_message}
@@ -362,8 +364,11 @@ def send_email_with_gmail_api(to_email, to_name, subject, body):
         return "SUCCESS"
 
     except Exception as e:
+        import traceback
         error_msg = f"Gmail API error: {str(e)}"
+        full_traceback = traceback.format_exc()
         print(f"[GMAIL API ERROR] {error_msg}")
+        print(f"[GMAIL API ERROR TRACEBACK] {full_traceback}")
         return f"ERROR: {error_msg}"
 
 def send_initial_email(to_email, to_name, link):
@@ -733,10 +738,12 @@ def debug():
     except Exception as e:
         debug_info["CREDENTIALS_ERROR"] = str(e)
 
-    # Test Gmail API
+    # Test Gmail API with your own email
     try:
-        result = send_email_with_gmail_api("test@example.com", "Test User", "Test Subject", "Test Body")
+        test_email = session.get('user_email', 'mo.amin797@gmail.com')  # Use actual email
+        result = send_email_with_gmail_api(test_email, "Test User", "Test Subject", "Test Body")
         debug_info["GMAIL_TEST"] = result
+        debug_info["GMAIL_TEST_EMAIL"] = test_email
     except Exception as e:
         debug_info["GMAIL_TEST_ERROR"] = str(e)
 
