@@ -23,7 +23,7 @@ load_dotenv()
 APP_TITLE = "User Study Booking"
 TZ = ZoneInfo("America/Toronto")
 PORT = int(os.getenv("PORT", "5000"))
-HOST_BASE = os.getenv("HOST_BASE", f"http://localhost:{PORT}")      # e.g. https://localhost:5000
+HOST_BASE = "https://uncut-jocelynn-pronunciative.ngrok-free.dev"      # Hardcoded ngrok URL
 CALENDAR_ID = os.getenv("CALENDAR_ID", "")                          # e.g. your_shared_calendar_id@group.calendar.google.com
 OAUTH_CLIENT_JSON = os.getenv("GOOGLE_CLIENT_SECRETS", "credentials.json")
 TOKEN_JSON = os.getenv("GOOGLE_TOKEN", "token.json")
@@ -79,24 +79,84 @@ def init_db():
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY,
             participant_id INTEGER NOT NULL,
-            start_time TEXT NOT NULL,
-            end_time TEXT NOT NULL,
+            preference1_start TEXT NOT NULL,
+            preference1_end TEXT NOT NULL,
+            preference2_start TEXT,
+            preference2_end TEXT,
+            preference3_start TEXT,
+            preference3_end TEXT,
+            selected_start_time TEXT NULL,
+            selected_end_time TEXT NULL,
             status TEXT DEFAULT 'pending',
             calendar_event_id TEXT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             admin_confirmed_at TIMESTAMP NULL,
             FOREIGN KEY (participant_id) REFERENCES participants (id)
         );
+        CREATE TABLE IF NOT EXISTS blocked_slots (
+            id INTEGER PRIMARY KEY,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
         """)
         # defaults
         if not con.execute("SELECT 1 FROM settings WHERE k='email_body'").fetchone():
             con.execute("INSERT INTO settings(k,v) VALUES(?,?)",
                         ("email_body",
-                         "Hi {{name}},\\n\\nThank you for volunteering to participate in our user study!\\n\\nPlease access our interactive calendar and select your preferred time slot:\\n\\n🔗 CALENDAR LINK: {{link}}\\n\\nThis will take you to our availability calendar where you can see all open time slots."))
+                         "Hi {{name}},\\n\\nThank you for volunteering to participate in our user study at Synlab (Toronto Metropolitan University)!\\n\\nWe are conducting a user study under the supervision of Professor Ali Mazalek to evaluate the efficiency of tangibles. Your participation will help advance our research.\\n\\nPlease access our interactive calendar and select your preferred time slot:\\n\\nCALENDAR LINK: {{link}}\\n\\nThis will take you to our availability calendar where you can see all open time slots."))
         if not con.execute("SELECT 1 FROM settings WHERE k='consent_html'").fetchone():
             con.execute("INSERT INTO settings(k,v) VALUES(?,?)",
                         ("consent_html",
                          "<h2>Consent Form</h2><p>Please read this consent carefully before booking. You agree to participate voluntarily. Contact us with any questions.</p>"))
+
+        # Update existing email template to include Synlab branding
+        con.execute("UPDATE settings SET v=? WHERE k='email_body'",
+                   ("Hi {{name}},\\n\\nThank you for volunteering to participate in our user study at Synlab (Toronto Metropolitan University)!\\n\\nWe are conducting a user study under the supervision of Professor Ali Mazalek to evaluate the efficiency of tangibles. Your participation will help advance our research.\\n\\nAs compensation for your participation, you will receive a $15 CAD Amazon gift card upon completion of the study.\\n\\nPlease access our interactive calendar and select your preferred time slots (choose 3 options):\\n\\nCALENDAR LINK: {{link}}\\n\\nThis will take you to our availability calendar where you can select up to 3 preferred time slots.",))
+
+        # Migrate existing bookings table to new schema
+        try:
+            # Check if old columns exist
+            old_columns = con.execute("PRAGMA table_info(bookings)").fetchall()
+            old_column_names = [col[1] for col in old_columns]
+
+            if 'start_time' in old_column_names and 'preference1_start' not in old_column_names:
+                # Backup old data
+                old_bookings = con.execute("SELECT * FROM bookings").fetchall()
+
+                # Drop old table and recreate with new schema
+                con.execute("DROP TABLE bookings")
+                con.execute("""
+                CREATE TABLE bookings (
+                    id INTEGER PRIMARY KEY,
+                    participant_id INTEGER NOT NULL,
+                    preference1_start TEXT NOT NULL,
+                    preference1_end TEXT NOT NULL,
+                    preference2_start TEXT,
+                    preference2_end TEXT,
+                    preference3_start TEXT,
+                    preference3_end TEXT,
+                    selected_start_time TEXT NULL,
+                    selected_end_time TEXT NULL,
+                    status TEXT DEFAULT 'pending',
+                    calendar_event_id TEXT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    admin_confirmed_at TIMESTAMP NULL,
+                    FOREIGN KEY (participant_id) REFERENCES participants (id)
+                )
+                """)
+
+                # Migrate old data (convert single booking to preference1)
+                for booking in old_bookings:
+                    con.execute("""
+                    INSERT INTO bookings (id, participant_id, preference1_start, preference1_end,
+                                        selected_start_time, selected_end_time, status, calendar_event_id,
+                                        created_at, admin_confirmed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (booking[0], booking[1], booking[2], booking[3], booking[2], booking[3],
+                          booking[4], booking[5], booking[6], booking[7]))
+        except Exception as e:
+            print(f"[DB MIGRATION] {e}")  # Non-fatal migration error
 
 init_db()
 
@@ -297,9 +357,9 @@ def parse_iso(s):  # RFC3339 -> aware datetime
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 def slot_range_for_day(day_local: datetime):
-    """Yield (start_local, end_local) 1-hour slots 09:00..22:00 (last start 21:00)."""
+    """Yield (start_local, end_local) 1-hour slots 09:00..01:00 (last start 24:00)."""
     base = day_local.replace(hour=9, minute=0, second=0, microsecond=0, tzinfo=TZ)
-    for h in range(0, 13):  # 9..21 inclusive
+    for h in range(0, 16):  # 9..24 inclusive
         start = base + timedelta(hours=h)
         end = start + timedelta(hours=1)
         yield start, end
@@ -315,6 +375,15 @@ def freebusy_blocks(service, start_utc_iso, end_utc_iso):
     return fb["calendars"][CALENDAR_ID]["busy"]  # list of {start,end}
 
 def is_free(service, start_local: datetime, end_local: datetime):
+    # Check if slot is blocked by admin
+    with db() as con:
+        blocked = con.execute(
+            "SELECT 1 FROM blocked_slots WHERE start_time = ? AND end_time = ?",
+            (start_local.isoformat(), end_local.isoformat())
+        ).fetchone()
+        if blocked:
+            return False
+
     # Query only the 2h window around it for speed
     min_iso = to_iso_utc(start_local - timedelta(minutes=1))
     max_iso = to_iso_utc(end_local + timedelta(minutes=1))
@@ -383,7 +452,17 @@ def send_initial_email(to_email, to_name, link):
 
     # Enhanced email body with calendar selection info
     enhanced_body = f"""
-{body}
+Hi {to_name},
+
+Thank you for volunteering to participate in our user study at Synlab (Toronto Metropolitan University)!
+
+We are conducting a user study under the supervision of Professor Ali Mazalek to evaluate the efficiency of tangibles with an interactive AR app on Meta Quest headset. Your participation will help advance our research and you will receive a $15 Amazon gift card for your time.
+
+Please access our interactive calendar and select your preferred time slot:
+
+CALENDAR LINK: {link}
+
+This will take you to our availability calendar where you can see all open time slots.
 
 📅 INTERACTIVE CALENDAR SELECTION:
 • Click the link above to view our availability calendar
@@ -401,55 +480,50 @@ def send_initial_email(to_email, to_name, link):
 Reply to this email if you need assistance.
 
 ---
-User Study Booking System
+Synlab - Toronto Metropolitan University
+Professor Ali Mazalek
 """
 
-    subject = "📅 User Study Invitation - Pick Your Time Slot"
+    subject = "Research Participation Invitation - Synlab TMU (Prof. Ali Mazalek)"
 
-    # GUARANTEED WORKING EMAIL - Using HTTP requests to SendGrid
-    import requests
-    import json
+    # Send email directly using SMTP
+    print(f"[INITIAL EMAIL] Attempting to send via SMTP to {to_email}")
 
-    # SendGrid API (free tier: 100 emails/day)
-    sendgrid_api_key = os.getenv("SENDGRID_API_KEY", "")
-
-    if sendgrid_api_key:
+    if not SMTP_HOST:
+        print(f"[EMAIL FALLBACK] No SMTP configured, logging email for manual sending")
+    else:
         try:
-            print(f"[SENDGRID] Sending email to {to_email}")
+            import smtplib
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
 
-            headers = {
-                "Authorization": f"Bearer {sendgrid_api_key}",
-                "Content-Type": "application/json"
-            }
+            # Create email
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = subject
+            msg['From'] = f"Prof. Ali Mazalek - Synlab TMU <{SMTP_USER}>"
+            msg['To'] = f"{to_name} <{to_email}>"
 
-            data = {
-                "personalizations": [{
-                    "to": [{"email": to_email, "name": to_name}],
-                    "subject": subject
-                }],
-                "from": {"email": SMTP_USER, "name": "User Study Team"},
-                "content": [{
-                    "type": "text/plain",
-                    "value": enhanced_body
-                }]
-            }
+            # Plain text part
+            text_part = MIMEText(enhanced_body, 'plain')
+            msg.attach(text_part)
 
-            response = requests.post(
-                "https://api.sendgrid.com/v3/mail/send",
-                headers=headers,
-                json=data,
-                timeout=10
-            )
+            # HTML part with clickable link
+            html_body = enhanced_body.replace(f"CALENDAR LINK: {link}",
+                f'<p><strong>CALENDAR LINK:</strong> <a href="{link}" style="color: #0066cc; text-decoration: underline;">{link}</a></p>')
+            html_part = MIMEText(html_body.replace('\n', '<br>'), 'html')
+            msg.attach(html_part)
 
-            if response.status_code == 202:
-                print(f"[SENDGRID] Email sent successfully to {to_email}")
-                return "SUCCESS"
-            else:
-                print(f"[SENDGRID ERROR] Status: {response.status_code}, Response: {response.text}")
-                # Fall through to backup method
+            # Send email
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.send_message(msg)
+
+            print(f"[INITIAL EMAIL] Email sent successfully via SMTP to {to_email}")
+            return "SUCCESS"
+
         except Exception as e:
-            print(f"[SENDGRID ERROR] {str(e)}")
-            # Fall through to backup method
+            print(f"[INITIAL EMAIL ERROR] SMTP failed: {str(e)}")
 
     # BACKUP: Simple email logging that always works
     print(f"[EMAIL FALLBACK] Logging email for manual sending")
@@ -952,119 +1026,276 @@ def oauth2callback():
 ADMIN_HTML = """
 <!doctype html><meta charset="utf-8">
 <title>Admin · {{title}}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
  * { box-sizing: border-box; }
  body {
    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif;
-   max-width: 1200px; margin: 0 auto; padding: 20px;
+   margin: 0; padding: 0; min-height: 100vh;
    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-   min-height: 100vh;
  }
  .container {
-   background: white; border-radius: 16px; padding: 40px;
-   box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+   max-width: 1400px; margin: 0 auto; padding: 20px;
  }
- h1 {
-   margin: 0 0 30px; color: #2d3748; font-size: 2.5em;
+ .header {
+   background: rgba(255,255,255,0.1); backdrop-filter: blur(20px);
+   border-radius: 20px; padding: 30px; margin-bottom: 30px;
+   color: white; display: flex; justify-content: space-between; align-items: center;
+   box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+ }
+ .header h1 {
+   margin: 0; font-size: 3em; font-weight: 700;
+   text-shadow: 0 2px 10px rgba(0,0,0,0.1);
+ }
+ .user-info {
+   text-align: right; font-size: 0.95em;
+   background: rgba(255,255,255,0.2); padding: 15px; border-radius: 12px;
+ }
+ .user-info a {
+   color: #fed7d7; text-decoration: none; font-weight: 600;
+   transition: color 0.2s;
+ }
+ .user-info a:hover { color: white; }
+ .dashboard-grid {
+   display: grid; grid-template-columns: 2fr 1fr; gap: 30px; margin-bottom: 30px;
+ }
+ .status-overview {
+   background: white; border-radius: 20px; padding: 30px;
+   box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+ }
+ .status-cards {
+   display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 30px;
+ }
+ .status-card {
+   background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+   border-radius: 16px; padding: 20px; text-align: center; position: relative;
+   border: 1px solid #e2e8f0; transition: all 0.3s;
+ }
+ .status-card:hover { transform: translateY(-5px); box-shadow: 0 15px 35px rgba(0,0,0,0.1); }
+ .status-card.success { border-color: #68d391; background: linear-gradient(135deg, #f0fff4 0%, #c6f6d5 100%); }
+ .status-card.warning { border-color: #fbb454; background: linear-gradient(135deg, #fffbf0 0%, #fed7aa 100%); }
+ .status-card.danger { border-color: #fc8181; background: linear-gradient(135deg, #fff5f5 0%, #fed7d7 100%); }
+ .status-card h3 { margin: 0 0 10px; font-size: 1.1em; color: #2d3748; }
+ .status-card .value { font-size: 2.2em; font-weight: 700; color: #1a202c; margin: 10px 0; }
+ .status-card .icon { position: absolute; top: 15px; right: 15px; font-size: 1.5em; opacity: 0.3; }
+ .quick-actions {
+   background: white; border-radius: 20px; padding: 30px;
+   box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+ }
+ .action-btn {
+   display: block; width: 100%; padding: 15px; margin: 10px 0;
+   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+   color: white; border: none; border-radius: 12px; font-weight: 600;
+   font-size: 1.1em; cursor: pointer; transition: all 0.3s;
+   text-decoration: none; text-align: center;
+ }
+ .action-btn:hover { transform: translateY(-2px); box-shadow: 0 15px 30px rgba(102, 126, 234, 0.4); }
+ .action-btn.secondary {
+   background: linear-gradient(135deg, #718096 0%, #4a5568 100%);
+ }
+ .section {
+   background: white; border-radius: 20px; padding: 40px; margin: 30px 0;
+   box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+ }
+ .section-title {
+   font-size: 1.8em; font-weight: 700; color: #2d3748; margin: 0 0 30px;
    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
  }
- .status-bar {
-   background: #f7fafc; border: 1px solid #e2e8f0; border-radius: 12px;
-   padding: 16px; margin-bottom: 30px; display: flex; justify-content: space-between;
+ .form-group { margin: 25px 0; }
+ .form-label {
+   display: block; font-weight: 600; margin-bottom: 8px;
+   color: #4a5568; font-size: 1em;
  }
- .status-item { display: flex; align-items: center; gap: 8px; }
- .status-icon { width: 20px; height: 20px; }
- form {
-   margin: 30px 0; padding: 30px; background: #f8fafc;
-   border: 1px solid #e2e8f0; border-radius: 16px;
+ .form-input {
+   width: 100%; padding: 15px 20px; border: 2px solid #e2e8f0;
+   border-radius: 12px; font-size: 16px; transition: all 0.3s;
+   font-family: inherit; background: #f8fafc;
  }
- h3 { color: #2d3748; margin: 0 0 20px; font-size: 1.3em; }
- label {
-   display: block; font-weight: 600; margin: 15px 0 8px;
-   color: #4a5568; font-size: 0.95em;
+ .form-input:focus {
+   outline: none; border-color: #667eea; background: white;
+   box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
  }
- input[type=text], input[type=email], textarea {
-   width: 100%; padding: 12px 16px; border: 2px solid #e2e8f0;
-   border-radius: 10px; font-size: 16px; transition: all 0.2s;
-   font-family: inherit;
+ .form-textarea {
+   resize: vertical; min-height: 120px;
  }
- input[type=text]:focus, input[type=email]:focus, textarea:focus {
-   outline: none; border-color: #667eea; box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
- }
- textarea { resize: vertical; min-height: 120px; }
- .btn {
+ .btn-primary {
    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-   color: white; border: none; padding: 12px 24px; border-radius: 10px;
-   cursor: pointer; font-weight: 600; font-size: 16px; transition: all 0.2s;
+   color: white; border: none; padding: 15px 30px; border-radius: 12px;
+   cursor: pointer; font-weight: 600; font-size: 1.1em; transition: all 0.3s;
    font-family: inherit;
  }
- .btn:hover { transform: translateY(-2px); box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3); }
- .muted { color: #718096; font-size: 0.9em; }
- .warn { color: #e53e3e; font-weight: 600; }
- .success { color: #38a169; font-weight: 600; }
- .success-msg { background: #c6f6d5; color: #2f855a; border-radius: 10px; padding: 15px; margin: 20px 0; font-weight: 600; }
- code { background: #edf2f7; padding: 4px 8px; border-radius: 6px; font-family: 'SF Mono', Monaco, monospace; }
- .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; }
+ .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 15px 30px rgba(102, 126, 234, 0.4); }
+ .btn-success { background: linear-gradient(135deg, #48bb78 0%, #38a169 100%); }
+ .btn-danger { background: linear-gradient(135deg, #f56565 0%, #e53e3e 100%); }
  .booking-item {
+   background: #f8fafc; border: 2px solid #e2e8f0; border-radius: 16px;
+   padding: 25px; margin: 20px 0; transition: all 0.3s;
+ }
+ .booking-item:hover {
+   border-color: #667eea; box-shadow: 0 10px 25px rgba(102, 126, 234, 0.1);
+   transform: translateY(-3px);
+ }
+ .booking-header {
+   display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;
+ }
+ .participant-info h4 {
+   margin: 0 0 5px; font-size: 1.3em; color: #2d3748;
+ }
+ .participant-email {
+   color: #667eea; font-weight: 600; margin: 0;
+ }
+ .booking-date {
+   color: #718096; font-size: 0.9em; margin: 5px 0;
+ }
+ .preferences-grid {
+   display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+   gap: 15px; margin: 20px 0;
+ }
+ .preference-option {
+   background: white; border: 1px solid #e2e8f0; border-radius: 12px;
+   padding: 15px; position: relative; transition: all 0.3s;
+ }
+ .preference-option:hover {
+   border-color: #48bb78; box-shadow: 0 5px 15px rgba(72, 187, 120, 0.1);
+ }
+ .preference-label {
+   font-weight: 600; color: #4a5568; font-size: 0.9em; margin-bottom: 8px;
+ }
+ .preference-time {
+   font-size: 1.1em; color: #2d3748; margin-bottom: 15px;
+ }
+ .select-btn {
+   background: #48bb78; color: white; border: none; padding: 8px 16px;
+   border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.2s;
+   font-size: 0.9em;
+ }
+ .select-btn:hover { background: #38a169; transform: scale(1.05); }
+ .reject-all-btn {
+   background: #f56565; color: white; border: none; padding: 12px 24px;
+   border-radius: 10px; font-weight: 600; cursor: pointer; transition: all 0.3s;
+ }
+ .reject-all-btn:hover { background: #e53e3e; transform: translateY(-2px); }
+ .remove-booking-btn {
+   background: #f56565; color: white; border: none; padding: 12px 20px;
+   border-radius: 10px; font-weight: 600; cursor: pointer; transition: all 0.3s;
+   font-size: 0.9em;
+ }
+ .remove-booking-btn:hover { background: #e53e3e; transform: translateY(-2px); }
+ .booking-item.confirmed {
+   border-left: 4px solid #48bb78; background: linear-gradient(135deg, #f0fff4 0%, #e6fffa 100%);
+ }
+ .booking-time {
+   font-weight: 600; color: #2d3748; margin: 8px 0;
+ }
+ .calendar-id {
+   font-size: 0.8em; color: #718096; font-family: monospace;
+ }
+ .success-msg {
+   background: linear-gradient(135deg, #c6f6d5 0%, #9ae6b4 100%);
+   color: #22543d; border-radius: 12px; padding: 20px; margin: 25px 0;
+   font-weight: 600; border: 1px solid #68d391;
+ }
+ .participant-form {
+   background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+   border-radius: 16px; padding: 30px; margin: 20px 0;
+   border: 1px solid #bae6fd;
+ }
+ .participants-container { margin: 20px 0; }
+ .participant-row {
    background: white; border: 2px solid #e2e8f0; border-radius: 12px;
-   padding: 20px; margin: 15px 0; display: flex; justify-content: space-between;
-   align-items: center; transition: all 0.2s;
+   padding: 20px; margin: 15px 0; position: relative; transition: all 0.3s;
  }
- .booking-item:hover { border-color: #667eea; box-shadow: 0 4px 12px rgba(102, 126, 234, 0.1); }
- .booking-info { flex: 1; }
- .booking-time { font-weight: 600; color: #2d3748; font-size: 1.1em; }
- .booking-participant { color: #4a5568; margin: 5px 0; }
- .booking-date { color: #718096; font-size: 0.9em; }
- .booking-actions { display: flex; gap: 10px; }
- .btn-approve { background: #48bb78; }
- .btn-approve:hover { background: #38a169; }
- .btn-reject { background: #f56565; }
- .btn-reject:hover { background: #e53e3e; }
- .badge {
-   display: inline-block; padding: 4px 12px; border-radius: 20px;
-   font-size: 0.8em; font-weight: 600;
+ .participant-row:hover { border-color: #667eea; box-shadow: 0 5px 15px rgba(102, 126, 234, 0.1); }
+ .participant-fields {
+   display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 15px;
  }
- .badge-pending { background: #fef5e7; color: #92400e; }
+ .remove-participant {
+   position: absolute; top: 15px; right: 15px; background: #f56565;
+   color: white; border: none; border-radius: 50%; width: 30px; height: 30px;
+   cursor: pointer; font-weight: bold; transition: all 0.2s;
+ }
+ .remove-participant:hover { background: #e53e3e; transform: scale(1.1); }
+ .add-participant {
+   background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
+   color: white; border: none; padding: 12px 24px; border-radius: 12px;
+   cursor: pointer; font-weight: 600; margin: 20px 0; transition: all 0.3s;
+ }
+ .add-participant:hover { transform: translateY(-2px); box-shadow: 0 10px 20px rgba(72, 187, 120, 0.3); }
+ .batch-actions {
+   background: linear-gradient(135deg, #edf2f7 0%, #e2e8f0 100%);
+   border-radius: 12px; padding: 20px; margin: 30px 0; text-align: center;
+   border: 1px solid #cbd5e0;
+ }
+ @media (max-width: 1024px) {
+   .dashboard-grid { grid-template-columns: 1fr; }
+   .status-cards { grid-template-columns: 1fr 1fr; }
+ }
  @media (max-width: 768px) {
-   .grid { grid-template-columns: 1fr; }
-   body { padding: 10px; }
-   .container { padding: 20px; }
-   .booking-item { flex-direction: column; align-items: flex-start; gap: 15px; }
-   .booking-actions { align-self: stretch; justify-content: flex-end; }
+   .container { padding: 15px; }
+   .header { flex-direction: column; text-align: center; gap: 20px; }
+   .header h1 { font-size: 2.2em; }
+   .status-cards { grid-template-columns: 1fr; }
+   .preferences-grid { grid-template-columns: 1fr; }
+   .participant-fields { grid-template-columns: 1fr; }
+   .booking-header { flex-direction: column; align-items: flex-start; gap: 10px; }
  }
 </style>
 <body>
 <div class="container">
-<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+
+<!-- Header -->
+<div class="header">
   <h1>📅 Admin Dashboard</h1>
-  <div style="text-align: right;">
-    <div style="color: #4a5568; font-size: 14px;">👤 {{user_name or user_email}}</div>
-    <div style="color: #718096; font-size: 12px;">{{user_email}}</div>
-    <a href="/logout" style="color: #e53e3e; font-size: 12px; text-decoration: none;">🚪 Logout</a>
+  <div class="user-info">
+    <div style="font-size: 1.1em; margin-bottom: 5px;">👤 {{user_name or user_email}}</div>
+    <div style="opacity: 0.8; margin-bottom: 8px;">{{user_email}}</div>
+    <a href="/logout">🚪 Logout</a>
   </div>
 </div>
 
-<div class="status-bar">
-  <div class="status-item">
-    <span>📋 Calendar ID:</span>
-    <code>{{cal_id}}</code>
+<!-- Dashboard Overview -->
+<div class="dashboard-grid">
+  <div class="status-overview">
+    <div class="status-cards">
+      <div class="status-card {% if authed %}success{% else %}danger{% endif %}">
+        <div class="icon">📅</div>
+        <h3>Calendar Status</h3>
+        <div class="value">{% if authed %}✅{% else %}❌{% endif %}</div>
+        {% if not authed %}
+        <a href="/google-auth" class="action-btn" style="padding: 8px 16px; margin: 10px 0;">Connect Now</a>
+        {% endif %}
+      </div>
+
+      <div class="status-card {% if gmail_ready %}success{% else %}warning{% endif %}">
+        <div class="icon">📧</div>
+        <h3>Email System</h3>
+        <div class="value">{% if gmail_ready %}✅{% else %}⚠️{% endif %}</div>
+        {% if not gmail_ready %}
+        <a href="/force-gmail-auth" class="action-btn" style="padding: 8px 16px; margin: 10px 0;">Fix Gmail</a>
+        {% endif %}
+      </div>
+
+      <div class="status-card {% if pending_bookings %}warning{% else %}success{% endif %}">
+        <div class="icon">⏳</div>
+        <h3>Pending Approvals</h3>
+        <div class="value">{{pending_bookings|length}}</div>
+      </div>
+    </div>
+
+    <div style="background: #f8fafc; border-radius: 12px; padding: 20px; margin-top: 20px;">
+      <h4 style="margin: 0 0 10px; color: #4a5568;">📋 Calendar Configuration</h4>
+      <code style="font-size: 0.9em; background: #e2e8f0; padding: 8px 12px; border-radius: 6px; display: block;">{{cal_id}}</code>
+    </div>
   </div>
-  <div class="status-item">
-    {% if authed %}
-      <span class="success">✅ Google Calendar Connected</span>
-    {% else %}
-      <span class="warn">❌ Not Connected</span>
-      <a href="/google-auth" class="btn" style="margin-left: 10px; padding: 6px 12px; font-size: 14px;">Connect Now</a>
-    {% endif %}
-  </div>
-  <div class="status-item">
-    {% if gmail_ready %}
-      <span class="success">📧 Gmail Ready</span>
-    {% else %}
-      <span class="warn">❌ Gmail Not Ready</span>
-      <a href="/force-gmail-auth" class="btn" style="margin-left: 10px; padding: 6px 12px; font-size: 14px;">Fix Gmail Permissions</a>
-    {% endif %}
+
+  <div class="quick-actions">
+    <h3 style="margin: 0 0 20px; color: #2d3748;">⚡ Quick Actions</h3>
+    <a href="/admin/calendar" class="action-btn">📅 View Schedule Calendar</a>
+    <a href="#add-participants" class="action-btn">➕ Add Participants</a>
+    <a href="#email-template" class="action-btn secondary">📝 Edit Email Template</a>
+    <a href="#consent-form" class="action-btn secondary">📋 Manage Consent Form</a>
+    <a href="/debug" class="action-btn secondary">🐛 Debug Info</a>
   </div>
 </div>
 
@@ -1072,84 +1303,201 @@ ADMIN_HTML = """
 <div class="success-msg">✅ {{success}}</div>
 {% endif %}
 
+<!-- Pending Bookings -->
 {% if pending_bookings %}
-<form method="post" action="/admin/bookings">
-  <h3>⏳ Pending Booking Approvals ({{pending_bookings|length}})</h3>
-  {% for booking in pending_bookings %}
-  <div class="booking-item">
-    <div class="booking-info">
-      <div class="booking-time">
-        {{booking.start_time_formatted}} – {{booking.end_time_formatted}}
+<div class="section">
+  <h2 class="section-title">⏳ Pending Booking Approvals ({{pending_bookings|length}})</h2>
+
+  <form method="post" action="/admin/bookings">
+    {% for booking in pending_bookings %}
+    <div class="booking-item">
+      <div class="booking-header">
+        <div class="participant-info">
+          <h4>{{booking.name}}</h4>
+          <p class="participant-email">{{booking.email}}</p>
+          <p class="booking-date">📅 Requested: {{booking.created_at_formatted}}</p>
+        </div>
+        <button type="submit" name="action" value="reject_{{booking.id}}" class="reject-all-btn">
+          ❌ Reject All Options
+        </button>
       </div>
-      <div class="booking-participant">
-        👤 <strong>{{booking.name}}</strong> ({{booking.email}})
+
+      <div class="preferences-grid">
+        {% for pref in booking.preferences %}
+        <div class="preference-option">
+          <div class="preference-label">Option {{pref.option_num}}</div>
+          <div class="preference-time">{{pref.start_formatted}} – {{pref.end_formatted}}</div>
+          <button type="submit" name="action" value="approve_{{booking.id}}_{{pref.start}}_{{pref.end}}" class="select-btn">
+            ✅ Select This Time
+          </button>
+        </div>
+        {% endfor %}
       </div>
-      <div class="booking-date">
-        📅 Requested: {{booking.created_at_formatted}}
-      </div>
-    </div>
-    <div class="booking-actions">
-      <button type="submit" name="action" value="approve_{{booking.id}}" class="btn btn-approve">
-        ✅ Approve
-      </button>
-      <button type="submit" name="action" value="reject_{{booking.id}}" class="btn btn-reject">
-        ❌ Reject
-      </button>
-    </div>
-  </div>
-  {% endfor %}
-</form>
-{% endif %}
-
-<div class="grid">
-  <form method="post" action="/admin/participant">
-    <h3>➕ Add New Participant</h3>
-    <label>👤 Full Name</label>
-    <input name="name" required placeholder="Enter participant's full name" value="">
-
-    <label>📧 Email Address</label>
-    <input type="email" name="email" required placeholder="participant@email.com" value="">
-
-    <button class="btn" type="submit">Create Booking Link & Send Email</button>
-    <p class="muted">📤 Email will be sent automatically from your configured SMTP account</p>
-  </form>
-
-  <form method="post" action="/admin/email">
-    <h3>📝 Email Template</h3>
-    <label>Email Body (use {{name}} and {{link}} placeholders)</label>
-    <textarea name="body" rows="6" placeholder="Hi {{name}}, please book your slot: {{link}}">{{ email_body }}</textarea>
-    <button class="btn">💾 Save Email Template</button>
-  </form>
-</div>
-
-<form method="post" action="/admin/consent">
-  <h3>📋 Consent Form (HTML)</h3>
-  <label>HTML Content (participants see this before booking)</label>
-  <textarea name="html" rows="6" placeholder="<h2>Research Study Consent</h2><p>Your consent form content here...</p>">{{ consent_html }}</textarea>
-  <button class="btn">💾 Save HTML Consent</button>
-</form>
-
-<form method="post" action="/admin/upload-consent" enctype="multipart/form-data">
-  <h3>📄 Upload Consent File</h3>
-  <label>Upload PDF or DOC file (max 16MB)</label>
-  <input type="file" name="consent_file" accept=".pdf,.doc,.docx" required style="margin: 10px 0;">
-  <button class="btn">📤 Upload Consent File</button>
-  <p class="muted">🔗 Uploaded files will be available at <a href="/consent" target="_blank">/consent</a></p>
-
-  {% if consent_files %}
-  <div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #e2e8f0;">
-    <strong>📁 Uploaded Files:</strong>
-    {% for file in consent_files %}
-    <div style="margin: 8px 0; padding: 8px; background: #f8fafc; border-radius: 6px;">
-      <a href="/uploads/{{file.filename}}" target="_blank" style="color: #667eea;">{{file.original_name}}</a>
-      <span class="muted" style="float: right;">{{file.upload_date}}</span>
     </div>
     {% endfor %}
+  </form>
+</div>
+{% endif %}
+
+<!-- Confirmed Bookings -->
+{% if confirmed_bookings %}
+<div class="section">
+  <h2 class="section-title">✅ Confirmed Bookings ({{confirmed_bookings|length}})</h2>
+
+  <form method="post" action="/admin/bookings">
+    {% for booking in confirmed_bookings %}
+    <div class="booking-item confirmed">
+      <div class="booking-header">
+        <div class="participant-info">
+          <h4>{{booking.name}}</h4>
+          <p class="participant-email">{{booking.email}}</p>
+          <p class="booking-date">✅ Confirmed: {{booking.confirmed_at_formatted}}</p>
+          <p class="booking-time">🕐 {{booking.start_formatted}} – {{booking.end_formatted}}</p>
+          {% if booking.calendar_event_id %}
+          <p class="calendar-id">📅 Calendar Event: {{booking.calendar_event_id[:20]}}...</p>
+          {% endif %}
+        </div>
+        <button type="submit" name="action" value="remove_{{booking.id}}" class="remove-booking-btn"
+                onclick="return confirm('Are you sure you want to remove this confirmed booking? This will cancel the calendar event and notify the participant.')">
+          🗑️ Remove Booking
+        </button>
+      </div>
+    </div>
+    {% endfor %}
+  </form>
+</div>
+{% endif %}
+
+<!-- Add Participants Section -->
+<div class="section" id="add-participants">
+  <h2 class="section-title">👥 Add New Participants</h2>
+
+  <div class="participant-form">
+    <form method="post" action="/admin/participants/batch" id="participantForm">
+      <div id="participantsContainer" class="participants-container">
+        <div class="participant-row">
+          <div class="participant-fields">
+            <div class="form-group">
+              <label class="form-label">👤 Full Name</label>
+              <input name="names[]" class="form-input" required placeholder="Enter participant's full name">
+            </div>
+            <div class="form-group">
+              <label class="form-label">📧 Email Address</label>
+              <input type="email" name="emails[]" class="form-input" required placeholder="participant@email.com">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <button type="button" class="add-participant" onclick="addParticipant()">
+        ➕ Add Another Participant
+      </button>
+
+      <div class="batch-actions">
+        <button type="submit" class="btn-primary">
+          📤 Create All Booking Links & Send Emails
+        </button>
+        <p style="margin: 15px 0 0; color: #4a5568; font-size: 0.95em;">
+          📧 Emails will be sent automatically to all participants
+        </p>
+      </div>
+    </form>
   </div>
-  {% endif %}
-</form>
+</div>
+
+<!-- Email Template Section -->
+<div class="section" id="email-template">
+  <h2 class="section-title">📝 Email Template Configuration</h2>
+
+  <form method="post" action="/admin/email">
+    <div class="form-group">
+      <label class="form-label">Email Body Template</label>
+      <p style="color: #718096; font-size: 0.9em; margin-bottom: 10px;">
+        Use <code>{{name}}</code> for participant name and <code>{{link}}</code> for booking link
+      </p>
+      <textarea name="body" class="form-input form-textarea" rows="8" placeholder="Hi {{name}}, please book your slot: {{link}}">{{ email_body }}</textarea>
+    </div>
+    <button type="submit" class="btn-primary">💾 Save Email Template</button>
+  </form>
+</div>
+
+<!-- Consent Form Section -->
+<div class="section" id="consent-form">
+  <h2 class="section-title">📋 Consent Form Management</h2>
+
+  <form method="post" action="/admin/consent" style="margin-bottom: 30px;">
+    <div class="form-group">
+      <label class="form-label">HTML Content</label>
+      <p style="color: #718096; font-size: 0.9em; margin-bottom: 10px;">
+        Participants will see this before booking their time slots
+      </p>
+      <textarea name="html" class="form-input form-textarea" rows="8" placeholder="<h2>Research Study Consent</h2><p>Your consent form content here...</p>">{{ consent_html }}</textarea>
+    </div>
+    <button type="submit" class="btn-primary">💾 Save HTML Consent</button>
+  </form>
+
+  <form method="post" action="/admin/upload-consent" enctype="multipart/form-data">
+    <div class="form-group">
+      <label class="form-label">Upload Consent Document</label>
+      <p style="color: #718096; font-size: 0.9em; margin-bottom: 10px;">
+        Upload PDF, DOC, or DOCX files (max 16MB)
+      </p>
+      <input type="file" name="consent_file" accept=".pdf,.doc,.docx" required class="form-input" style="padding: 10px;">
+    </div>
+    <button type="submit" class="btn-primary">📤 Upload Consent File</button>
+    <p style="color: #718096; font-size: 0.9em; margin-top: 10px;">
+      🔗 Uploaded files will be available at <a href="/consent" target="_blank" style="color: #667eea;">/consent</a>
+    </p>
+
+    {% if consent_files %}
+    <div style="margin-top: 30px; padding-top: 20px; border-top: 2px solid #e2e8f0;">
+      <h4 style="color: #2d3748; margin: 0 0 20px;">📁 Uploaded Documents</h4>
+      {% for file in consent_files %}
+      <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 15px; margin: 10px 0; display: flex; justify-content: space-between; align-items: center;">
+        <a href="/uploads/{{file.filename}}" target="_blank" style="color: #667eea; font-weight: 600; text-decoration: none;">
+          📎 {{file.original_name}}
+        </a>
+        <span style="color: #718096; font-size: 0.9em;">{{file.upload_date}}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </form>
+</div>
 
 </div>
+
+<script>
+function addParticipant() {
+  const container = document.getElementById('participantsContainer');
+  const newRow = document.createElement('div');
+  newRow.className = 'participant-row';
+  newRow.innerHTML = `
+    <button type="button" class="remove-participant" onclick="removeParticipant(this)" title="Remove participant">×</button>
+    <div class="participant-fields">
+      <div class="form-group">
+        <label class="form-label">👤 Full Name</label>
+        <input name="names[]" class="form-input" required placeholder="Enter participant's full name">
+      </div>
+      <div class="form-group">
+        <label class="form-label">📧 Email Address</label>
+        <input type="email" name="emails[]" class="form-input" required placeholder="participant@email.com">
+      </div>
+    </div>
+  `;
+  container.appendChild(newRow);
+}
+
+function removeParticipant(button) {
+  const participantRows = document.querySelectorAll('.participant-row');
+  if (participantRows.length > 1) {
+    button.parentElement.remove();
+  } else {
+    alert('You must have at least one participant.');
+  }
+}
+</script>
+
 </body>
 """
 
@@ -1184,19 +1532,65 @@ def admin():
         success = "Booking approved and calendar invitation sent!"
     elif msg == "booking_rejected":
         success = "Booking rejected successfully."
+    elif msg == "booking_removed":
+        success = "Confirmed booking removed successfully. Calendar event deleted and participant notified."
+    elif msg == "booking_not_found":
+        success = "Booking not found or not confirmed."
+    elif msg == "removal_failed":
+        success = "Failed to remove booking. Please try again."
 
     # Get pending bookings with formatted times
     pending_bookings = []
     for booking in get_pending_bookings():
-        start_dt = datetime.fromisoformat(booking['start_time'])
-        end_dt = datetime.fromisoformat(booking['end_time'])
         created_dt = datetime.fromisoformat(booking['created_at'])
 
         formatted_booking = dict(booking)
-        formatted_booking['start_time_formatted'] = start_dt.strftime('%a %b %d, %I:%M %p').replace(' 0', ' ')
-        formatted_booking['end_time_formatted'] = end_dt.strftime('%I:%M %p').replace(' 0', ' ')
         formatted_booking['created_at_formatted'] = created_dt.strftime('%m/%d %I:%M %p').replace(' 0', ' ')
+
+        # Format all 3 time slot preferences
+        preferences = []
+        for i in range(1, 4):
+            start_key = f'preference{i}_start'
+            end_key = f'preference{i}_end'
+            if booking[start_key] and booking[end_key]:
+                start_dt = datetime.fromisoformat(booking[start_key])
+                end_dt = datetime.fromisoformat(booking[end_key])
+                pref = {
+                    'start': booking[start_key],
+                    'end': booking[end_key],
+                    'start_formatted': start_dt.strftime('%a %b %d, %I:%M %p').replace(' 0', ' '),
+                    'end_formatted': end_dt.strftime('%I:%M %p').replace(' 0', ' '),
+                    'option_num': i
+                }
+                preferences.append(pref)
+
+        formatted_booking['preferences'] = preferences
         pending_bookings.append(formatted_booking)
+
+    # Get confirmed bookings
+    confirmed_bookings = []
+    with db() as con:
+        bookings = con.execute("""
+            SELECT b.*, p.name, p.email
+            FROM bookings b
+            JOIN participants p ON b.participant_id = p.id
+            WHERE b.status = 'confirmed'
+            AND b.selected_start_time IS NOT NULL
+            AND b.selected_end_time IS NOT NULL
+            ORDER BY b.selected_start_time ASC
+        """).fetchall()
+
+        for booking in bookings:
+            confirmed_dt = datetime.fromisoformat(booking['admin_confirmed_at']) if booking['admin_confirmed_at'] else None
+            start_dt = datetime.fromisoformat(booking['selected_start_time'])
+            end_dt = datetime.fromisoformat(booking['selected_end_time'])
+
+            formatted_booking = dict(booking)
+            formatted_booking['confirmed_at_formatted'] = confirmed_dt.strftime('%m/%d %I:%M %p').replace(' 0', ' ') if confirmed_dt else 'N/A'
+            formatted_booking['start_formatted'] = start_dt.strftime('%a %b %d, %I:%M %p').replace(' 0', ' ')
+            formatted_booking['end_formatted'] = end_dt.strftime('%I:%M %p').replace(' 0', ' ')
+
+            confirmed_bookings.append(formatted_booking)
 
     return render_template_string(
         ADMIN_HTML,
@@ -1208,6 +1602,7 @@ def admin():
         consent_html=get_setting("consent_html"),
         consent_files=get_consent_files(),
         pending_bookings=pending_bookings,
+        confirmed_bookings=confirmed_bookings,
         success=success,
         user_email=session.get('user_email', ''),
         user_name=session.get('user_name', ''),
@@ -1255,11 +1650,21 @@ def upload_consent():
 @require_auth
 def admin_bookings():
     action = request.form.get("action", "")
+    print(f"[DEBUG] Received action: '{action}'")
     if not action:
+        print(f"[DEBUG] No action received, redirecting to admin")
         return redirect(url_for("admin"))
 
     if action.startswith("approve_"):
-        booking_id = action.split("_")[1]
+        # Parse action: approve_{booking_id}_{start_time}_{end_time}
+        parts = action.split("_", 3)
+        if len(parts) < 4:
+            # Old format or malformed
+            return redirect(url_for("admin"))
+
+        booking_id = parts[1]
+        selected_start = parts[2]
+        selected_end = parts[3]
 
         # Get booking details
         with db() as con:
@@ -1273,12 +1678,18 @@ def admin_bookings():
         if not booking:
             return redirect(url_for("admin"))
 
-        # Create calendar event
-        start_dt = datetime.fromisoformat(booking['start_time'])
-        end_dt = datetime.fromisoformat(booking['end_time'])
+        # Create calendar event with selected time
+        start_dt = datetime.fromisoformat(selected_start)
+        end_dt = datetime.fromisoformat(selected_end)
 
         try:
+            print(f"[DEBUG] Attempting to approve booking {booking_id}")
+            print(f"[DEBUG] Selected time: {selected_start} to {selected_end}")
+            print(f"[DEBUG] CALENDAR_ID: {CALENDAR_ID}")
+
             svc = calendar_service()
+            print(f"[DEBUG] Calendar service obtained successfully")
+
             event = {
                 "summary": f"User Study — {booking['name']}",
                 "description": f"Participant: {booking['name']} <{booking['email']}>\nConsent: {HOST_BASE}/consent\n\nStatus: CONFIRMED by Admin",
@@ -1286,30 +1697,52 @@ def admin_bookings():
                 "end":   {"dateTime": to_iso_utc(end_dt),   "timeZone": "UTC"},
                 "attendees": [{"email": booking["email"]}],
             }
-            created = svc.events().insert(
-                calendarId=CALENDAR_ID,
-                body=event,
-                sendUpdates="all"
-            ).execute()
+            print(f"[DEBUG] Event object created: {event}")
 
-            # Update booking status
+            # Try the configured calendar first, fallback to primary
+            calendar_id_to_use = CALENDAR_ID or "primary"
+            try:
+                created = svc.events().insert(
+                    calendarId=calendar_id_to_use,
+                    body=event,
+                    sendUpdates="all"
+                ).execute()
+                print(f"[DEBUG] Calendar event created: {created.get('id')} on calendar: {calendar_id_to_use}")
+            except Exception as calendar_error:
+                if calendar_id_to_use != "primary":
+                    print(f"[DEBUG] Failed to create event on configured calendar, trying primary calendar")
+                    created = svc.events().insert(
+                        calendarId="primary",
+                        body=event,
+                        sendUpdates="all"
+                    ).execute()
+                    print(f"[DEBUG] Calendar event created on primary calendar: {created.get('id')}")
+                else:
+                    raise calendar_error
+
+            # Update booking status with selected time
             with db() as con:
                 con.execute("""
                     UPDATE bookings
                     SET status = 'confirmed',
+                        selected_start_time = ?,
+                        selected_end_time = ?,
                         calendar_event_id = ?,
                         admin_confirmed_at = CURRENT_TIMESTAMP
                     WHERE id = ?
-                """, (created['id'], booking_id))
+                """, (selected_start, selected_end, created['id'], booking_id))
+            print(f"[DEBUG] Database updated successfully")
 
             # Send confirmation email
-            send_confirmation_email(booking['email'], booking['name'],
-                                   booking['start_time'], booking['end_time'])
+            email_result = send_confirmation_email(booking['email'], booking['name'], selected_start, selected_end)
+            print(f"[DEBUG] Confirmation email result: {email_result}")
 
             return redirect(url_for("admin") + "?msg=booking_approved")
 
         except Exception as e:
+            import traceback
             print(f"[BOOKING APPROVAL ERROR] {e}")
+            print(f"[BOOKING APPROVAL ERROR TRACEBACK] {traceback.format_exc()}")
             return redirect(url_for("admin"))
 
     elif action.startswith("reject_"):
@@ -1326,7 +1759,656 @@ def admin_bookings():
 
         return redirect(url_for("admin") + "?msg=booking_rejected")
 
+    elif action.startswith("remove_"):
+        booking_id = action.split("_")[1]
+
+        # Get booking details first
+        with db() as con:
+            booking = con.execute("""
+                SELECT b.*, p.name, p.email
+                FROM bookings b
+                JOIN participants p ON b.participant_id = p.id
+                WHERE b.id = ? AND b.status = 'confirmed'
+            """, (booking_id,)).fetchone()
+
+        if not booking:
+            return redirect(url_for("admin") + "?msg=booking_not_found")
+
+        try:
+            # Remove calendar event if it exists
+            if booking['calendar_event_id']:
+                svc = calendar_service()
+                calendar_id_to_use = CALENDAR_ID or "primary"
+
+                try:
+                    svc.events().delete(
+                        calendarId=calendar_id_to_use,
+                        eventId=booking['calendar_event_id']
+                    ).execute()
+                    print(f"[DEBUG] Calendar event {booking['calendar_event_id']} deleted from calendar: {calendar_id_to_use}")
+                except Exception as calendar_error:
+                    if calendar_id_to_use != "primary":
+                        print(f"[DEBUG] Failed to delete from configured calendar, trying primary")
+                        try:
+                            svc.events().delete(
+                                calendarId="primary",
+                                eventId=booking['calendar_event_id']
+                            ).execute()
+                            print(f"[DEBUG] Calendar event {booking['calendar_event_id']} deleted from primary calendar")
+                        except Exception as primary_error:
+                            print(f"[WARNING] Failed to delete calendar event: {primary_error}")
+                    else:
+                        print(f"[WARNING] Failed to delete calendar event: {calendar_error}")
+
+            # Update booking status to removed
+            with db() as con:
+                con.execute("""
+                    UPDATE bookings
+                    SET status = 'removed_by_admin',
+                        calendar_event_id = NULL
+                    WHERE id = ?
+                """, (booking_id,))
+
+            # Send notification email to participant
+            try:
+                selected_start = booking['selected_start_time']
+                selected_end = booking['selected_end_time']
+                start_dt = datetime.fromisoformat(selected_start)
+                end_dt = datetime.fromisoformat(selected_end)
+                start_str = start_dt.strftime('%a %b %d, %I:%M %p').replace(' 0', ' ')
+                end_str = end_dt.strftime('%I:%M %p').replace(' 0', ' ')
+
+                # Create cancellation email
+                subject = "❌ User Study Booking CANCELLED - Important Update"
+
+                body = f"""Hi {booking['name']},
+
+We regret to inform you that your confirmed booking has been cancelled by our admin team.
+
+❌ CANCELLED APPOINTMENT:
+{start_str} – {end_str} (Toronto time)
+
+🗑️ WHAT'S BEEN DONE:
+• The calendar event has been removed from your calendar
+• Your booking slot is now available for other participants
+• You'll no longer receive reminders for this session
+
+📧 NEXT STEPS:
+If you have any questions or would like to reschedule, please reply to this email.
+
+Thank you for your understanding.
+
+Best regards,
+The Research Team
+
+---
+User Study Booking System"""
+
+                # Use the same email sending logic as confirmation emails
+                result = send_email_with_gmail_api(booking['email'], booking['name'], subject, body)
+
+                if result != "SUCCESS":
+                    # Fallback to SMTP if available
+                    if SMTP_HOST:
+                        try:
+                            msg = EmailMessage()
+                            msg["From"] = SMTP_FROM
+                            msg["To"] = f"{booking['name']} <{booking['email']}>"
+                            msg["Subject"] = subject
+                            msg.set_content(body)
+
+                            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+                                s.starttls()
+                                if SMTP_USER and SMTP_PASS:
+                                    s.login(SMTP_USER, SMTP_PASS)
+                                s.send_message(msg)
+                            print(f"[DEBUG] Cancellation email sent via SMTP to {booking['email']}")
+                        except Exception as smtp_error:
+                            print(f"[WARNING] SMTP cancellation email failed: {smtp_error}")
+                    else:
+                        print(f"[DEBUG] DRY-RUN cancellation email for {booking['email']}")
+                else:
+                    print(f"[DEBUG] Cancellation email sent via Gmail API to {booking['email']}")
+
+            except Exception as email_error:
+                print(f"[WARNING] Failed to send cancellation email: {email_error}")
+
+            # Check if request came from calendar view
+            referer = request.headers.get('Referer', '')
+            if '/admin/calendar' in referer:
+                # Extract week parameter if present
+                from urllib.parse import urlparse, parse_qs
+                parsed_url = urlparse(referer)
+                query_params = parse_qs(parsed_url.query)
+                week = query_params.get('week', ['0'])[0]
+                try:
+                    week = int(week)
+                except (ValueError, TypeError):
+                    week = 0
+                return redirect(url_for("admin_calendar", week=week, msg="booking_removed"))
+            else:
+                return redirect(url_for("admin") + "?msg=booking_removed")
+
+        except Exception as e:
+            import traceback
+            print(f"[BOOKING REMOVAL ERROR] {e}")
+            print(f"[BOOKING REMOVAL ERROR TRACEBACK] {traceback.format_exc()}")
+            return redirect(url_for("admin") + "?msg=removal_failed")
+
     return redirect(url_for("admin"))
+
+def generate_calendar_slots_html(calendar_days):
+    """Generate HTML for calendar time slots"""
+    html = ""
+    for hour in range(9, 25):
+        html += f'<div class="time-label">{hour}:00</div>'
+        for day in calendar_days:
+            slot = day["slots"][hour-9]
+            html += f'''
+            <div class="time-slot {slot["status"]}"
+                 data-start="{slot["start"]}"
+                 data-end="{slot["end"]}">
+              <div class="slot-content">
+                {get_slot_content(slot)}
+              </div>
+            </div>'''
+    return html
+
+@app.get("/admin/calendar")
+@require_auth
+def admin_calendar():
+    # Get week offset and message from query parameters
+    try:
+        week_offset = int(request.args.get('week', 0))
+    except (ValueError, TypeError):
+        week_offset = 0
+    msg = request.args.get("msg", "")
+    if week_offset < 0:
+        week_offset = 0
+    elif week_offset > 12:  # Show more weeks for admin
+        week_offset = 12
+
+    # Calculate the start date for the requested week
+    today_local = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = today_local + timedelta(days=week_offset * 7)
+    days_from_monday = week_start.weekday()
+    week_start = week_start - timedelta(days=days_from_monday)
+
+    now_local = datetime.now(TZ)
+
+    # Get calendar service
+    try:
+        service = calendar_service()
+        calendar_available = True
+    except Exception as e:
+        print(f"[ADMIN CALENDAR ERROR] Calendar service unavailable: {e}")
+        service = None
+        calendar_available = False
+
+    # Get all blocked slots
+    blocked_slots = []
+    with db() as con:
+        slots = con.execute("SELECT start_time, end_time FROM blocked_slots").fetchall()
+        for slot in slots:
+            blocked_slots.append({
+                'start': datetime.fromisoformat(slot['start_time']),
+                'end': datetime.fromisoformat(slot['end_time'])
+            })
+
+    # Get all confirmed bookings for this week
+    week_end = week_start + timedelta(days=7)
+    confirmed_bookings = []
+    if calendar_available:
+        with db() as con:
+            bookings = con.execute("""
+                SELECT b.*, p.name, p.email
+                FROM bookings b
+                JOIN participants p ON b.participant_id = p.id
+                WHERE b.status = 'confirmed'
+                AND b.selected_start_time IS NOT NULL
+                AND b.selected_end_time IS NOT NULL
+            """).fetchall()
+
+            for booking in bookings:
+                start_dt = datetime.fromisoformat(booking['selected_start_time'])
+                end_dt = datetime.fromisoformat(booking['selected_end_time'])
+
+                # Check if this booking falls within the current week
+                if week_start <= start_dt < week_end:
+                    # Safely get calendar_event_id
+                    try:
+                        calendar_event_id = booking['calendar_event_id'] or ''
+                    except (KeyError, TypeError):
+                        calendar_event_id = ''
+
+                    confirmed_bookings.append({
+                        'id': booking['id'],
+                        'name': booking['name'],
+                        'email': booking['email'],
+                        'start': start_dt,
+                        'end': end_dt,
+                        'start_formatted': start_dt.strftime('%a %m/%d %I:%M %p').replace(' 0', ' '),
+                        'end_formatted': end_dt.strftime('%I:%M %p').replace(' 0', ' '),
+                        'calendar_event_id': calendar_event_id
+                    })
+
+    # Generate calendar data (similar to invite function but with booking info)
+    calendar_days = []
+    for d in range(7):
+        day = week_start + timedelta(days=d)
+        day_header = day.strftime("%a %m/%d").replace(" 0", " ")
+
+        day_slots = []
+        for hour in range(9, 25):
+            if hour == 24:
+                # Handle midnight as hour 0 of next day
+                start = (day + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=TZ)
+            else:
+                start = day.replace(hour=hour, minute=0, second=0, microsecond=0, tzinfo=TZ)
+            end = start + timedelta(hours=1)
+
+            # Find any confirmed booking for this slot
+            slot_booking = None
+            for booking in confirmed_bookings:
+                if booking['start'] <= start < booking['end']:
+                    slot_booking = booking
+                    break
+
+            # Check if slot is blocked
+            is_blocked = False
+            for blocked in blocked_slots:
+                if blocked['start'] <= start < blocked['end']:
+                    is_blocked = True
+                    break
+
+            # Determine slot status
+            if start <= now_local:
+                status = "past"
+            elif slot_booking:
+                status = "booked"
+            elif is_blocked:
+                status = "blocked"
+            elif not calendar_available:
+                status = "unavailable"
+            elif is_free(service, start, end):
+                status = "available"
+            else:
+                status = "unavailable"
+
+            day_slots.append({
+                "status": status,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "booking": slot_booking,
+                "is_blocked": is_blocked
+            })
+
+        calendar_days.append({
+            "header": day_header,
+            "slots": day_slots
+        })
+
+    # Generate week label and navigation
+    start_date = week_start.strftime("%b %d").replace(" 0", " ")
+    end_date = (week_start + timedelta(days=6)).strftime("%b %d").replace(" 0", " ")
+    current_week_label = f"{start_date} - {end_date}"
+
+    prev_week_url = None
+    next_week_url = url_for('admin_calendar', week=week_offset+1) if week_offset < 12 else None
+
+    if week_offset > 0:
+        prev_week_url = url_for('admin_calendar', week=week_offset-1) if week_offset > 1 else url_for('admin_calendar')
+
+    # Generate the admin calendar HTML template
+    # Generate success message if any
+    success_msg = ""
+    if msg == "booking_removed":
+        success_msg = "✅ Booking removed successfully. Calendar event deleted and participant notified."
+    elif msg == "slot_blocked":
+        success_msg = "✅ Time slot blocked successfully."
+    elif msg == "slot_unblocked":
+        success_msg = "✅ Time slot unblocked successfully."
+
+    return generate_admin_calendar_html(
+        current_week_label,
+        week_offset,
+        prev_week_url,
+        next_week_url,
+        calendar_days,
+        confirmed_bookings,
+        success_msg
+    )
+
+def generate_admin_calendar_html(current_week_label, week_offset, prev_week_url, next_week_url, calendar_days, confirmed_bookings, success_msg=""):
+    """Generate the complete admin calendar HTML"""
+
+    # Generate day headers
+    day_headers = "".join(f'<div class="day-header">{day["header"]}</div>' for day in calendar_days)
+
+    # Generate calendar slots
+    calendar_slots = generate_calendar_slots_html(calendar_days)
+
+    # Generate navigation buttons
+    prev_nav = f'<a href="{prev_week_url}" class="nav-btn">⬅️ Previous Week</a>' if prev_week_url else '<div style="width:120px"></div>'
+    next_nav = f'<a href="{next_week_url}" class="nav-btn">Next Week ➡️</a>' if next_week_url else '<div style="width:120px"></div>'
+
+    # Generate booking details (informational only - removal via time slots)
+    if confirmed_bookings:
+        booking_html = '<div class="booking-list">'
+        for booking in confirmed_bookings:
+            calendar_event_id = booking.get("calendar_event_id", "") or ""
+            calendar_id_short = calendar_event_id[:15] + "..." if calendar_event_id else "N/A"
+            booking_html += f'''
+            <div class="booking-item info-only">
+              <div class="booking-info">
+                <h4>{booking["name"]}</h4>
+                <p class="email">{booking["email"]}</p>
+                <p class="time">{booking["start_formatted"]} – {booking["end_formatted"]}</p>
+                <p class="calendar-id">📅 Event: {calendar_id_short}</p>
+              </div>
+              <div class="booking-note">
+                <p class="remove-hint">💡 Click the time slot on the calendar above to remove this booking</p>
+              </div>
+            </div>'''
+        booking_html += '</div>'
+    else:
+        booking_html = '<p class="no-bookings">No confirmed bookings for this week.</p>'
+
+    # Generate success message HTML
+    success_html = ""
+    if success_msg:
+        success_html = f'<div class="success-msg">{success_msg}</div>'
+
+    return f"""
+    <!doctype html><meta charset="utf-8">
+    <title>Admin Calendar · {APP_TITLE}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+    {get_admin_calendar_styles()}
+    </style>
+    <body>
+    <div class="container">
+
+    <div class="header">
+      <h1>📅 Admin Calendar View</h1>
+      <div class="header-actions">
+        <a href="/admin" class="action-btn secondary">← Back to Dashboard</a>
+      </div>
+    </div>
+
+    {success_html}
+
+    <div class="calendar-header">
+      <h2>Weekly Schedule Overview</h2>
+      <div class="calendar-nav">
+        {prev_nav}
+        <span class="week-label">{current_week_label}</span>
+        {next_nav}
+      </div>
+    </div>
+
+    <div class="week-info">
+      <span>Week {week_offset + 1}</span> •
+      <span>Showing {len(confirmed_bookings)} confirmed booking(s)</span> •
+      <a href="/admin/calendar">Current Week</a>
+    </div>
+
+    <div class="legend">
+      <div class="legend-item">
+        <div class="legend-color legend-available"></div>
+        <span>✅ Available</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-color legend-booked"></div>
+        <span>📅 Booked</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-color legend-blocked"></div>
+        <span>🚫 Blocked</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-color legend-unavailable"></div>
+        <span>❌ Unavailable</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-color legend-past"></div>
+        <span>⏰ Past</span>
+      </div>
+    </div>
+
+    <div class="calendar-grid">
+      <div class="time-header">Time</div>
+      {day_headers}
+      {calendar_slots}
+    </div>
+
+    <div class="booking-details">
+      <h3>📋 Confirmed Bookings This Week</h3>
+      {booking_html}
+    </div>
+
+    </div>
+    </body>
+    """
+
+def get_slot_content(slot):
+    if slot["status"] == "booked" and slot["booking"]:
+        booking = slot["booking"]
+        return f'''
+        <form method="post" action="/admin/bookings" class="slot-form">
+            <button type="submit" name="action" value="remove_{booking["id"]}" class="booking-slot-btn"
+                    onclick="return confirm('Remove {booking["name"]}\\'s confirmed booking?\\n\\nThis will:\\n• Cancel the calendar event\\n• Notify the participant\\n• Free up this time slot')">
+                <div class="booking-label">{booking["name"]}</div>
+                <div class="booking-time">{booking["start"].strftime("%I:%M").lstrip("0")}–{booking["end"].strftime("%I:%M").lstrip("0")}</div>
+                <div class="remove-indicator">🗑️ Click to remove</div>
+            </button>
+        </form>
+        '''
+    elif slot["status"] == "blocked":
+        return f'''
+        <form method="post" action="/admin/unblock-slot" class="slot-form">
+            <input type="hidden" name="start_time" value="{slot["start"]}">
+            <input type="hidden" name="end_time" value="{slot["end"]}">
+            <button type="submit" class="block-slot-btn blocked"
+                    onclick="return confirm('Unblock this time slot?')">
+                <div class="block-label">🚫 Blocked</div>
+                <div class="block-indicator">Click to unblock</div>
+            </button>
+        </form>
+        '''
+    elif slot["status"] == "available":
+        return f'''
+        <form method="post" action="/admin/block-slot" class="slot-form">
+            <input type="hidden" name="start_time" value="{slot["start"]}">
+            <input type="hidden" name="end_time" value="{slot["end"]}">
+            <button type="submit" class="block-slot-btn available"
+                    onclick="return confirm('Block this time slot?\\n\\nThis will make it unavailable for participants.')">
+                <div class="available-label">✅</div>
+                <div class="block-indicator">Click to block</div>
+            </button>
+        </form>
+        '''
+    elif slot["status"] == "unavailable":
+        return "❌"
+    else:
+        return "⏰"
+
+def get_admin_calendar_styles():
+    return """
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif;
+      margin: 0; padding: 0; min-height: 100vh;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    }
+    .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+    .header {
+      background: rgba(255,255,255,0.1); backdrop-filter: blur(20px);
+      border-radius: 20px; padding: 30px; margin-bottom: 30px;
+      color: white; display: flex; justify-content: space-between; align-items: center;
+    }
+    .header h1 { margin: 0; font-size: 2.5em; font-weight: 700; }
+    .action-btn {
+      background: rgba(255,255,255,0.2); color: white; padding: 12px 20px;
+      border-radius: 10px; text-decoration: none; font-weight: 600; transition: all 0.3s;
+    }
+    .action-btn:hover { background: rgba(255,255,255,0.3); transform: translateY(-2px); }
+    .action-btn.secondary { background: rgba(255,255,255,0.15); }
+    .calendar-header {
+      background: white; border-radius: 16px; padding: 25px; margin-bottom: 20px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+    }
+    .calendar-header h2 { margin: 0 0 15px; color: #2d3748; }
+    .calendar-nav {
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .nav-btn {
+      background: #667eea; color: white; padding: 8px 16px; border-radius: 8px;
+      text-decoration: none; font-weight: 600; transition: all 0.3s;
+    }
+    .nav-btn:hover { background: #5a67d8; transform: translateY(-2px); }
+    .week-label { font-weight: 700; font-size: 1.2em; color: #2d3748; }
+    .week-info {
+      text-align: center; margin: 15px 0; color: #4a5568;
+      background: rgba(255,255,255,0.9); padding: 10px; border-radius: 8px;
+    }
+    .week-info a { color: #667eea; text-decoration: none; font-weight: 600; }
+    .legend {
+      display: flex; justify-content: center; gap: 30px; margin: 25px 0;
+      background: rgba(255,255,255,0.9); padding: 20px; border-radius: 12px;
+    }
+    .legend-item { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+    .legend-color {
+      width: 24px; height: 24px; border-radius: 6px; border: 2px solid #e2e8f0;
+    }
+    .legend-available { background: #f0fff4; border-color: #68d391; }
+    .legend-booked { background: #e6fffa; border-color: #4fd1c7; }
+    .legend-unavailable { background: #fed7d7; border-color: #f56565; }
+    .legend-past { background: #f7fafc; border-color: #e2e8f0; }
+    .calendar-grid {
+      display: grid; grid-template-columns: 100px repeat(7, 1fr); gap: 2px;
+      background: #e2e8f0; border-radius: 12px; overflow: hidden; margin: 20px 0;
+    }
+    .time-header, .day-header {
+      background: #667eea; color: white; padding: 15px; text-align: center;
+      font-weight: 700; font-size: 1em;
+    }
+    .time-label {
+      background: #f7fafc; padding: 15px; text-align: center; font-weight: 600;
+      color: #4a5568; display: flex; align-items: center; justify-content: center;
+    }
+    .time-slot {
+      background: white; min-height: 60px; position: relative;
+      border: 2px solid transparent; transition: all 0.3s;
+    }
+    .time-slot.available { background: #f0fff4; border-color: #68d391; }
+    .time-slot.booked { background: #e6fffa; border-color: #4fd1c7; }
+    .time-slot.blocked { background: #fef3c7; border-color: #f59e0b; }
+    .time-slot.unavailable { background: #fed7d7; border-color: #f56565; }
+    .time-slot.past { background: #f7fafc; border-color: #e2e8f0; }
+    .slot-content {
+      padding: 8px; font-size: 0.9em; text-align: center;
+      height: 100%; display: flex; flex-direction: column; justify-content: center;
+    }
+    .booking-label {
+      font-weight: 700; color: #2d3748; margin-bottom: 2px;
+      font-size: 0.85em; line-height: 1.2;
+    }
+    .booking-time {
+      font-size: 0.75em; color: #4a5568; font-weight: 600;
+    }
+    .booking-details {
+      background: white; border-radius: 16px; padding: 30px; margin-top: 30px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+    }
+    .booking-details h3 { margin: 0 0 20px; color: #2d3748; }
+    .booking-list { display: grid; gap: 15px; }
+    .booking-item {
+      background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px;
+      padding: 20px; transition: all 0.3s; display: flex; justify-content: space-between; align-items: center;
+    }
+    .booking-item:hover { border-color: #667eea; transform: translateY(-2px); }
+    .booking-info { flex: 1; }
+    .booking-item h4 { margin: 0 0 5px; color: #2d3748; }
+    .booking-item .email { margin: 0 0 8px; color: #667eea; font-weight: 600; }
+    .booking-item .time { margin: 0 0 5px; color: #4a5568; font-weight: 600; }
+    .booking-item .calendar-id { margin: 0; color: #718096; font-size: 0.8em; font-family: monospace; }
+    .booking-actions { margin-left: 20px; }
+    .remove-btn {
+      background: #f56565; color: white; border: none; padding: 8px 16px;
+      border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.3s;
+      font-size: 0.85em;
+    }
+    .remove-btn:hover { background: #e53e3e; transform: translateY(-2px); }
+    .no-bookings { color: #718096; text-align: center; font-style: italic; margin: 20px 0; }
+    .success-msg {
+      background: linear-gradient(135deg, #c6f6d5 0%, #9ae6b4 100%);
+      color: #22543d; border-radius: 12px; padding: 20px; margin: 25px 0;
+      font-weight: 600; border: 1px solid #68d391;
+    }
+    .slot-form {
+      margin: 0; padding: 0; width: 100%; height: 100%;
+    }
+    .booking-slot-btn {
+      background: none; border: none; padding: 0; margin: 0; width: 100%; height: 100%;
+      cursor: pointer; text-align: center; color: inherit; font-family: inherit;
+      transition: all 0.2s; border-radius: 4px;
+    }
+    .booking-slot-btn:hover {
+      background: rgba(255, 255, 255, 0.2); transform: scale(1.02);
+    }
+    .booking-slot-btn .booking-label {
+      font-weight: 600; font-size: 0.8em; margin-bottom: 2px;
+    }
+    .booking-slot-btn .booking-time {
+      font-size: 0.7em; margin-bottom: 2px;
+    }
+    .booking-slot-btn .remove-indicator {
+      font-size: 0.6em; opacity: 0.7; transition: opacity 0.2s;
+    }
+    .booking-slot-btn:hover .remove-indicator {
+      opacity: 1; font-weight: bold;
+    }
+    .booking-item.info-only {
+      background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+      border: 1px solid #bae6fd;
+    }
+    .booking-note {
+      margin-left: 20px; display: flex; align-items: center;
+    }
+    .remove-hint {
+      color: #6b7280; font-size: 0.8em; font-style: italic; margin: 0;
+      background: #f3f4f6; padding: 8px 12px; border-radius: 6px;
+    }
+    .block-slot-btn {
+      background: none; border: none; padding: 0; margin: 0; width: 100%; height: 100%;
+      cursor: pointer; text-align: center; color: inherit; font-family: inherit;
+      transition: all 0.2s; border-radius: 4px;
+    }
+    .block-slot-btn:hover {
+      background: rgba(255, 255, 255, 0.3); transform: scale(1.02);
+    }
+    .block-slot-btn .block-label, .block-slot-btn .available-label {
+      font-weight: 600; font-size: 1.2em; margin-bottom: 3px;
+    }
+    .block-slot-btn .block-indicator {
+      font-size: 0.65em; opacity: 0; transition: opacity 0.2s;
+      color: #4a5568; font-weight: 600;
+    }
+    .block-slot-btn:hover .block-indicator {
+      opacity: 1;
+    }
+    .legend-blocked { background: #fef3c7; border-color: #f59e0b; }
+    @media (max-width: 1024px) {
+      .calendar-grid { grid-template-columns: 80px repeat(7, 1fr); }
+      .legend { flex-direction: column; gap: 15px; }
+    }
+    @media (max-width: 768px) {
+      .header { flex-direction: column; gap: 20px; text-align: center; }
+      .calendar-nav { flex-direction: column; gap: 15px; }
+      .calendar-grid { grid-template-columns: 60px repeat(7, 1fr); }
+    }
+    """
 
 @app.post("/admin/participant")
 @require_auth
@@ -1337,6 +2419,9 @@ def admin_participant():
     with db() as con:
         con.execute("INSERT INTO participants(name,email,token) VALUES(?,?,?)", (name, email, token))
     link = f"{HOST_BASE}/invite/{token}"
+    print(f"[PARTICIPANT CREATION] Starting email process for {name} ({email})")
+    print(f"[DEBUG] HOST_BASE: {HOST_BASE}")
+    print(f"[DEBUG] Generated link: {link}")
     # Send initial email (with network error handling)
     email_result = send_initial_email(email, name, link)
 
@@ -1385,6 +2470,178 @@ def admin_participant():
 
     receipt_html += '<p><a href="/admin">← Back to Admin</a></p>'
     return receipt_html
+
+@app.post("/admin/participants/batch")
+@require_auth
+def admin_participants_batch():
+    names = request.form.getlist("names[]")
+    emails = request.form.getlist("emails[]")
+
+    if not names or not emails or len(names) != len(emails):
+        return redirect(url_for("admin") + "?msg=invalid_batch")
+
+    # Clean and validate data
+    participants_data = []
+    for i, (name, email) in enumerate(zip(names, emails)):
+        name = name.strip()
+        email = email.strip().lower()
+
+        if not name or not email:
+            return redirect(url_for("admin") + f"?msg=empty_fields_{i+1}")
+
+        participants_data.append({
+            'name': name,
+            'email': email,
+            'token': secrets.token_urlsafe(16)
+        })
+
+    # Create all participants in database
+    with db() as con:
+        for p in participants_data:
+            con.execute("INSERT INTO participants(name,email,token) VALUES(?,?,?)",
+                       (p['name'], p['email'], p['token']))
+
+    # Generate links and send emails
+    email_results = []
+    successful_participants = []
+    failed_participants = []
+
+    for p in participants_data:
+        link = f"{HOST_BASE}/invite/{p['token']}"
+        print(f"[BATCH PARTICIPANT] Processing {p['name']} ({p['email']})")
+
+        # Send email
+        email_result = send_initial_email(p['email'], p['name'], link)
+        email_results.append({
+            'name': p['name'],
+            'email': p['email'],
+            'link': link,
+            'result': email_result
+        })
+
+        if email_result == "SUCCESS":
+            successful_participants.append(p)
+        else:
+            failed_participants.append(p)
+
+    # Generate batch results page
+    total_count = len(participants_data)
+    success_count = len(successful_participants)
+    failed_count = len(failed_participants)
+
+    results_html = f"""
+    <!doctype html><meta charset="utf-8">
+    <title>Batch Participants Added</title>
+    <style>
+    body{{font-family:system-ui;max-width:800px;margin:40px auto;padding:20px;background:#f8fafc}}
+    .header{{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;padding:30px;border-radius:16px;margin-bottom:30px;text-align:center}}
+    .stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin:30px 0}}
+    .stat-card{{background:white;padding:20px;border-radius:12px;text-align:center;border:2px solid #e2e8f0}}
+    .stat-card.success{{border-color:#68d391;background:linear-gradient(135deg,#f0fff4 0%,#c6f6d5 100%)}}
+    .stat-card.error{{border-color:#fc8181;background:linear-gradient(135deg,#fff5f5 0%,#fed7d7 100%)}}
+    .stat-number{{font-size:3em;font-weight:700;margin:10px 0}}
+    .participant-grid{{display:grid;gap:15px;margin:20px 0}}
+    .participant-item{{background:white;border-radius:12px;padding:20px;border:2px solid #e2e8f0;transition:all 0.3s}}
+    .participant-item.success{{border-color:#68d391;background:linear-gradient(135deg,#f0fff4 0%,#e6fffa 100%)}}
+    .participant-item.failed{{border-color:#fc8181;background:linear-gradient(135deg,#fff5f5 0%,#fed7d7 100%)}}
+    .participant-item:hover{{transform:translateY(-2px);box-shadow:0 10px 25px rgba(0,0,0,0.1)}}
+    .status-badge{{display:inline-block;padding:4px 12px;border-radius:20px;font-size:0.8em;font-weight:600;margin-left:10px}}
+    .status-success{{background:#c6f6d5;color:#22543d}}
+    .status-failed{{background:#fed7d7;color:#9b2c2c}}
+    .link-box{{background:#f8fafc;padding:10px;border-radius:8px;margin-top:10px;font-size:0.9em;word-break:break-all}}
+    .back-btn{{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;padding:15px 30px;border-radius:12px;text-decoration:none;font-weight:600;display:inline-block;margin:30px 0;transition:all 0.3s}}
+    .back-btn:hover{{transform:translateY(-2px);box-shadow:0 15px 30px rgba(102,126,234,0.4)}}
+    </style>
+
+    <div class="header">
+        <h1>📤 Batch Participants Created</h1>
+        <p>Processing completed for {total_count} participant(s)</p>
+    </div>
+
+    <div class="stats">
+        <div class="stat-card success">
+            <div class="stat-number">{success_count}</div>
+            <h3>✅ Successful</h3>
+            <p>Emails sent successfully</p>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{total_count}</div>
+            <h3>👥 Total</h3>
+            <p>Participants processed</p>
+        </div>
+        <div class="stat-card {'error' if failed_count > 0 else ''}">
+            <div class="stat-number">{failed_count}</div>
+            <h3>⚠️ Failed</h3>
+            <p>Email sending failed</p>
+        </div>
+    </div>
+
+    <h2>📋 Detailed Results</h2>
+    <div class="participant-grid">
+    """
+
+    for result in email_results:
+        status_class = "success" if result['result'] == "SUCCESS" else "failed"
+        status_text = "✅ Email Sent" if result['result'] == "SUCCESS" else f"❌ {result['result']}"
+        status_badge_class = "status-success" if result['result'] == "SUCCESS" else "status-failed"
+
+        results_html += f"""
+        <div class="participant-item {status_class}">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                <h4 style="margin:0">{result['name']}</h4>
+                <span class="status-badge {status_badge_class}">{status_text}</span>
+            </div>
+            <p style="margin:5px 0;color:#667eea;font-weight:600">{result['email']}</p>
+            <div class="link-box">
+                <strong>Booking Link:</strong><br>
+                <a href="{result['link']}" target="_blank">{result['link']}</a>
+            </div>
+        </div>
+        """
+
+    results_html += f"""
+    </div>
+
+    <div style="text-align:center">
+        <a href="/admin" class="back-btn">← Back to Admin Dashboard</a>
+    </div>
+    """
+
+    return results_html
+
+@app.post("/admin/block-slot")
+@require_auth
+def admin_block_slot():
+    start_time = request.form.get("start_time")
+    end_time = request.form.get("end_time")
+    week = request.form.get("week", "0")
+
+    if not start_time or not end_time:
+        return redirect(url_for("admin_calendar", week=week) + "?msg=invalid_slot")
+
+    # Add to blocked slots
+    with db() as con:
+        con.execute("INSERT INTO blocked_slots(start_time, end_time) VALUES(?,?)",
+                   (start_time, end_time))
+
+    return redirect(url_for("admin_calendar", week=week) + "?msg=slot_blocked")
+
+@app.post("/admin/unblock-slot")
+@require_auth
+def admin_unblock_slot():
+    start_time = request.form.get("start_time")
+    end_time = request.form.get("end_time")
+    week = request.form.get("week", "0")
+
+    if not start_time or not end_time:
+        return redirect(url_for("admin_calendar", week=week) + "?msg=invalid_slot")
+
+    # Remove from blocked slots
+    with db() as con:
+        con.execute("DELETE FROM blocked_slots WHERE start_time=? AND end_time=?",
+                   (start_time, end_time))
+
+    return redirect(url_for("admin_calendar", week=week) + "?msg=slot_unblocked")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Consent page
@@ -1503,6 +2760,12 @@ INVITE_HTML = """
  .time-slot.past {
    background: #f7fafc; color: #a0aec0; cursor: not-allowed;
  }
+ .time-slot.selected {
+   background: #bee3f8; border-color: #3182ce; border-width: 3px;
+ }
+ .time-slot.selected:hover {
+   background: #90cdf4; border-color: #2c5282;
+ }
  .slot-status {
    font-size: 0.8em; font-weight: 600; text-align: center;
  }
@@ -1544,9 +2807,13 @@ INVITE_HTML = """
 <h2>📅 {{title}}</h2>
 
 <div class="welcome">
-  <p>👋 Hi <strong>{{name}}</strong>! Select your preferred 1-hour time slot from the calendar below.</p>
+  <p>👋 Hi <strong>{{name}}</strong>! Select up to <strong>3 preferred time slots</strong> from the calendar below. The admin will pick one for you.</p>
   <div class="timezone-info">
     🌍 All times shown in <strong>Toronto Time (EST/EDT)</strong>
+  </div>
+  <div id="selection-status" style="background: #e6fffa; padding: 10px; border-radius: 8px; margin: 10px 0; text-align: center; color: #234e52;">
+    <strong>Selected slots: <span id="slot-count">0</span>/3</strong>
+    <div id="selected-times"></div>
   </div>
 </div>
 
@@ -1562,8 +2829,28 @@ INVITE_HTML = """
   <div class="calendar-header">
     <h3 style="margin: 0; color: #2d3748;">📅 Available Time Slots</h3>
     <div class="calendar-nav">
-      <span style="color: #4a5568; font-weight: 600;">{{current_week_label}}</span>
+      {% if prev_week_url %}
+      <a href="{{prev_week_url}}" class="nav-btn" style="text-decoration: none;">⬅️ Previous Week</a>
+      {% else %}
+      <div style="width: 120px;"></div>
+      {% endif %}
+      <span style="color: #4a5568; font-weight: 600; margin: 0 20px;">{{current_week_label}}</span>
+      {% if next_week_url %}
+      <a href="{{next_week_url}}" class="nav-btn" style="text-decoration: none;">Next Week ➡️</a>
+      {% else %}
+      <div style="width: 120px;"></div>
+      {% endif %}
     </div>
+  </div>
+
+  <div style="text-align: center; margin: 15px 0; color: #718096;">
+    {% if week_offset == 0 %}
+    <strong>This Week</strong> •
+    {% else %}
+    <strong>Week {{week_offset + 1}}</strong> •
+    {% endif %}
+    Showing up to 8 weeks of availability •
+    <a href="/invite/{{request.view_args.token}}" style="color: #667eea; text-decoration: none;">📅 Current Week</a>
   </div>
 
   <div class="legend">
@@ -1587,12 +2874,13 @@ INVITE_HTML = """
     <div class="day-header">{{day.header}}</div>
     {% endfor %}
 
-    {% for hour in range(9, 22) %}
+    {% for hour in range(9, 25) %}
     <div class="time-label">{{hour}}:00</div>
     {% for day in calendar_days %}
     {% set slot = day.slots[hour-9] %}
     <div class="time-slot {{slot.status}}"
-         {% if slot.status == 'available' %}onclick="window.location.href='{{slot.url}}'"{% endif %}>
+         {% if slot.status == 'available' %}onclick="toggleSlot('{{slot.start}}', '{{slot.end}}', this)"{% endif %}
+         data-start="{{slot.start}}" data-end="{{slot.end}}">
       <div class="slot-status">
         {% if slot.status == 'available' %}✅{% elif slot.status == 'unavailable' %}❌{% else %}⏰{% endif %}
       </div>
@@ -1603,10 +2891,98 @@ INVITE_HTML = """
 </div>
 
 <div style="text-align: center; margin-top: 30px; color: #4a5568;">
-  💡 <strong>Tip:</strong> Click on any green ✅ slot to book that time
+  💡 <strong>Tip:</strong> Click on green ✅ slots to select (up to 3). Blue = selected. Click again to deselect.
+</div>
+
+<div style="text-align: center; margin: 30px 0;">
+  <button id="submit-btn" onclick="submitBooking()"
+          style="background: #667eea; color: white; border: none; padding: 15px 30px;
+                 border-radius: 8px; font-size: 1.1em; font-weight: 600; cursor: pointer;
+                 opacity: 0.5; transition: all 0.3s;" disabled>
+    📅 Submit Time Preferences
+  </button>
+  <div style="margin-top: 10px; font-size: 0.9em; color: #666;">
+    Select at least 1 time slot to continue
+  </div>
 </div>
 
 </div>
+
+<script>
+let selectedSlots = [];
+const maxSlots = 3;
+
+function toggleSlot(start, end, element) {
+  const slotKey = start + '|' + end;
+  const index = selectedSlots.findIndex(slot => slot.key === slotKey);
+
+  if (index >= 0) {
+    // Deselect
+    selectedSlots.splice(index, 1);
+    element.classList.remove('selected');
+  } else {
+    // Select (if under limit)
+    if (selectedSlots.length >= maxSlots) {
+      alert('You can only select up to 3 time slots');
+      return;
+    }
+    selectedSlots.push({key: slotKey, start: start, end: end, element: element});
+    element.classList.add('selected');
+  }
+
+  updateDisplay();
+}
+
+function updateDisplay() {
+  const count = selectedSlots.length;
+  document.getElementById('slot-count').textContent = count;
+
+  const timesDiv = document.getElementById('selected-times');
+  if (count === 0) {
+    timesDiv.innerHTML = '';
+  } else {
+    const timeStrings = selectedSlots.map((slot, i) => {
+      const startDate = new Date(slot.start);
+      const endDate = new Date(slot.end);
+      const timeStr = startDate.toLocaleDateString('en-US', {weekday: 'short', month: 'short', day: 'numeric'}) +
+                     ' ' + startDate.toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit'}) +
+                     '-' + endDate.toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit'});
+      return `<div style="margin: 5px 0; padding: 5px; background: white; border-radius: 4px;">
+                <strong>Choice ${i+1}:</strong> ${timeStr}
+              </div>`;
+    });
+    timesDiv.innerHTML = timeStrings.join('');
+  }
+
+  const submitBtn = document.getElementById('submit-btn');
+  if (count > 0) {
+    submitBtn.disabled = false;
+    submitBtn.style.opacity = '1';
+    submitBtn.querySelector('div').textContent = `Submit ${count} time preference${count > 1 ? 's' : ''}`;
+  } else {
+    submitBtn.disabled = true;
+    submitBtn.style.opacity = '0.5';
+  }
+}
+
+function submitBooking() {
+  if (selectedSlots.length === 0) {
+    alert('Please select at least one time slot');
+    return;
+  }
+
+  const token = window.location.pathname.split('/').pop();
+  let url = `/book?token=${token}`;
+
+  selectedSlots.forEach((slot, i) => {
+    url += `&start${i+1}=${encodeURIComponent(slot.start)}&end${i+1}=${encodeURIComponent(slot.end)}`;
+  });
+
+  console.log('Submitting booking with URL:', url);
+  window.location.href = url;
+}
+</script>
+
 </body>
 """
 
@@ -1618,8 +2994,21 @@ def invite(token):
     if not p:
         abort(404)
 
-    # build calendar view for the next 7 days starting today
+    # Get week offset from query parameter (0 = current week, 1 = next week, etc.)
+    week_offset = int(request.args.get('week', 0))
+    if week_offset < 0:
+        week_offset = 0
+    elif week_offset > 8:  # Limit to 8 weeks out
+        week_offset = 8
+
+    # Calculate the start date for the requested week
     today_local = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    # Get to the start of the week (Monday)
+    week_start = today_local + timedelta(days=week_offset * 7)
+    # Adjust to show Monday to Sunday
+    days_from_monday = week_start.weekday()  # 0=Monday, 6=Sunday
+    week_start = week_start - timedelta(days=days_from_monday)
+
     now_local = datetime.now(TZ)
 
     # Check if calendar service is available
@@ -1631,16 +3020,20 @@ def invite(token):
         service = None
         calendar_available = False
 
-    # Generate 7 days of calendar data
+    # Generate 7 days of calendar data (Monday to Sunday)
     calendar_days = []
     for d in range(7):
-        day = today_local + timedelta(days=d)
+        day = week_start + timedelta(days=d)
         day_header = day.strftime("%a %m/%d").replace(" 0", " ")
 
-        # Generate hour slots for this day (9 AM to 9 PM = 13 slots)
+        # Generate hour slots for this day (9 AM to 12 AM = 16 slots)
         day_slots = []
-        for hour in range(9, 22):  # 9 AM to 9 PM
-            start = day.replace(hour=hour, minute=0, second=0, microsecond=0, tzinfo=TZ)
+        for hour in range(9, 25):  # 9 AM to 12 AM
+            if hour == 24:
+                # Handle midnight as hour 0 of next day
+                start = (day + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=TZ)
+            else:
+                start = day.replace(hour=hour, minute=0, second=0, microsecond=0, tzinfo=TZ)
             end = start + timedelta(hours=1)
 
             # Determine slot status
@@ -1661,7 +3054,9 @@ def invite(token):
 
             day_slots.append({
                 "status": status,
-                "url": url
+                "url": url,
+                "start": start.isoformat(),
+                "end": end.isoformat()
             })
 
         calendar_days.append({
@@ -1670,9 +3065,16 @@ def invite(token):
         })
 
     # Generate week label
-    start_date = today_local.strftime("%b %d").replace(" 0", " ")
-    end_date = (today_local + timedelta(days=6)).strftime("%b %d").replace(" 0", " ")
+    start_date = week_start.strftime("%b %d").replace(" 0", " ")
+    end_date = (week_start + timedelta(days=6)).strftime("%b %d").replace(" 0", " ")
     current_week_label = f"{start_date} - {end_date}"
+
+    # Generate navigation URLs
+    prev_week_url = None
+    next_week_url = url_for('invite', token=token, week=week_offset+1) if week_offset < 8 else None
+
+    if week_offset > 0:
+        prev_week_url = url_for('invite', token=token, week=week_offset-1) if week_offset > 1 else url_for('invite', token=token)
 
     # Add error message if calendar is not available
     error_msg = request.args.get("error")
@@ -1685,15 +3087,24 @@ def invite(token):
         name=p["name"],
         calendar_days=calendar_days,
         current_week_label=current_week_label,
+        prev_week_url=prev_week_url,
+        next_week_url=next_week_url,
+        week_offset=week_offset,
         error=error_msg
     )
 
 @app.get("/book")
 def book():
     token = request.args.get("token","")
-    start_s = request.args.get("start","")
-    end_s   = request.args.get("end","")
-    if not (token and start_s and end_s):
+    # Get up to 3 time slot preferences
+    slots = []
+    for i in range(1, 4):
+        start_s = request.args.get(f"start{i}","")
+        end_s   = request.args.get(f"end{i}","")
+        if start_s and end_s:
+            slots.append((start_s, end_s))
+
+    if not (token and slots):
         abort(400)
 
     with db() as con:
@@ -1701,34 +3112,64 @@ def book():
     if not p:
         abort(404)
 
-    start = datetime.fromisoformat(start_s)
-    end   = datetime.fromisoformat(end_s)
-    nowl  = datetime.now(TZ)
-    # enforce business rules
-    if start.tzinfo is None or end.tzinfo is None:
-        start = start.replace(tzinfo=TZ); end = end.replace(tzinfo=TZ)
-    if end - start != timedelta(hours=1):
-        return redirect(url_for("invite", token=token, error="Invalid slot length."))
-    if start <= nowl:
-        return redirect(url_for("invite", token=token, error="That time is in the past."))
-    if not (start.hour >= 9 and end.hour <= 22):
-        return redirect(url_for("invite", token=token, error="Outside bookable hours."))
-
-    # check availability again
+    # Validate each time slot
+    validated_slots = []
     svc = calendar_service()
-    if not is_free(svc, start, end):
-        return redirect(url_for("invite", token=token, error="Sorry, that slot was just taken."))
+    nowl = datetime.now(TZ)
 
-    # Store booking request pending admin approval
+    for start_s, end_s in slots:
+        start = datetime.fromisoformat(start_s)
+        end   = datetime.fromisoformat(end_s)
+
+        # enforce business rules
+        if start.tzinfo is None or end.tzinfo is None:
+            start = start.replace(tzinfo=TZ); end = end.replace(tzinfo=TZ)
+        if end - start != timedelta(hours=1):
+            return redirect(url_for("invite", token=token, error="Invalid slot length."))
+        if start <= nowl:
+            return redirect(url_for("invite", token=token, error="That time is in the past."))
+        if not (start.hour >= 9 and end.hour <= 25):
+            return redirect(url_for("invite", token=token, error="Outside bookable hours."))
+
+        # check availability
+        if not is_free(svc, start, end):
+            return redirect(url_for("invite", token=token, error=f"Sorry, one of your selected slots was just taken."))
+
+        validated_slots.append((start, end))
+
+    # Store booking request with multiple preferences
     with db() as con:
-        con.execute("""
-            INSERT INTO bookings (participant_id, start_time, end_time, status)
-            VALUES (?, ?, ?, 'pending')
-        """, (p['id'], start.isoformat(), end.isoformat()))
+        # Build dynamic SQL based on number of slots provided
+        if len(validated_slots) == 1:
+            con.execute("""
+                INSERT INTO bookings (participant_id, preference1_start, preference1_end, status)
+                VALUES (?, ?, ?, 'pending')
+            """, (p['id'], validated_slots[0][0].isoformat(), validated_slots[0][1].isoformat()))
+        elif len(validated_slots) == 2:
+            con.execute("""
+                INSERT INTO bookings (participant_id, preference1_start, preference1_end,
+                                    preference2_start, preference2_end, status)
+                VALUES (?, ?, ?, ?, ?, 'pending')
+            """, (p['id'], validated_slots[0][0].isoformat(), validated_slots[0][1].isoformat(),
+                  validated_slots[1][0].isoformat(), validated_slots[1][1].isoformat()))
+        elif len(validated_slots) == 3:
+            con.execute("""
+                INSERT INTO bookings (participant_id, preference1_start, preference1_end,
+                                    preference2_start, preference2_end,
+                                    preference3_start, preference3_end, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+            """, (p['id'], validated_slots[0][0].isoformat(), validated_slots[0][1].isoformat(),
+                  validated_slots[1][0].isoformat(), validated_slots[1][1].isoformat(),
+                  validated_slots[2][0].isoformat(), validated_slots[2][1].isoformat()))
 
-    # Format time for display
-    start_str = start.strftime('%a %b %d, %I:%M %p').replace(' 0', ' ')
-    end_str = end.strftime('%I:%M %p').replace(' 0', ' ')
+    # Format times for display
+    slot_display = []
+    for i, (start, end) in enumerate(validated_slots, 1):
+        start_str = start.strftime('%a %b %d, %I:%M %p').replace(' 0', ' ')
+        end_str = end.strftime('%I:%M %p').replace(' 0', ' ')
+        slot_display.append(f"<strong>Option {i}:</strong> {start_str} – {end_str}")
+
+    slots_html = "<br>".join(slot_display)
 
     confirmation_html = f"""
     <!doctype html><meta charset='utf-8'>
@@ -1741,11 +3182,14 @@ def book():
     </style>
     <div class="pending">
         <h2>⏳ Booking Request Submitted!</h2>
-        <p><strong>{start_str} – {end_str}</strong><br>(Toronto time)</p>
+        <p><strong>Your Time Slot Preferences:</strong><br>
+        {slots_html}<br><br>
+        (Toronto time)</p>
     </div>
     <div class="info">
         📝 <strong>What happens next:</strong><br>
-        Your booking request has been submitted and is pending admin approval.
+        Your booking request with {len(validated_slots)} time slot preference(s) has been submitted and is pending admin approval.
+        The admin will select one of your preferred times.
     </div>
     <div class="next-steps">
         ✅ <strong>Once approved by admin:</strong><br>
