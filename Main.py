@@ -365,14 +365,21 @@ def slot_range_for_day(day_local: datetime):
         yield start, end
 
 def freebusy_blocks(service, start_utc_iso, end_utc_iso):
-    body = {
-        "timeMin": start_utc_iso,
-        "timeMax": end_utc_iso,
-        "timeZone": "UTC",
-        "items": [{"id": CALENDAR_ID}],
-    }
-    fb = service.freebusy().query(body=body).execute()
-    return fb["calendars"][CALENDAR_ID]["busy"]  # list of {start,end}
+    try:
+        body = {
+            "timeMin": start_utc_iso,
+            "timeMax": end_utc_iso,
+            "timeZone": "UTC",
+            "items": [{"id": CALENDAR_ID}],
+        }
+        fb = service.freebusy().query(body=body).execute()
+        return fb["calendars"][CALENDAR_ID]["busy"]  # list of {start,end}
+    except Exception as e:
+        # Handle rate limit errors gracefully
+        if "rateLimitExceeded" in str(e) or "Quota exceeded" in str(e):
+            print(f"[CALENDAR API] Rate limit exceeded, returning empty busy blocks")
+            return []
+        raise
 
 def is_free(service, start_local: datetime, end_local: datetime):
     # Check if slot is blocked by admin
@@ -1292,7 +1299,8 @@ ADMIN_HTML = """
   <div class="quick-actions">
     <h3 style="margin: 0 0 20px; color: #2d3748;">⚡ Quick Actions</h3>
     <a href="/admin/calendar" class="action-btn">📅 View Schedule Calendar</a>
-    <a href="#add-participants" class="action-btn">➕ Add Participants</a>
+    <a href="#direct-booking" class="action-btn btn-success">📆 Book Participant (Direct)</a>
+    <a href="#add-participants" class="action-btn">➕ Add Participants (Link)</a>
     <a href="#email-template" class="action-btn secondary">📝 Edit Email Template</a>
     <a href="#consent-form" class="action-btn secondary">📋 Manage Consent Form</a>
     <a href="/debug" class="action-btn secondary">🐛 Debug Info</a>
@@ -1368,9 +1376,51 @@ ADMIN_HTML = """
 </div>
 {% endif %}
 
+<!-- Direct Booking Section -->
+<div class="section" id="direct-booking">
+  <h2 class="section-title">📅 Direct Booking with Calendar Invite</h2>
+  <p style="color: #4a5568; margin-bottom: 20px;">Book a participant directly and send them a Google Calendar invite (no preference selection needed)</p>
+
+  <div class="participant-form" style="background: linear-gradient(135deg, #e0f2fe 0%, #bae6fd 100%); border-color: #7dd3fc;">
+    <form method="post" action="/admin/direct-booking">
+      <div class="participant-fields" style="grid-template-columns: 1fr 1fr;">
+        <div class="form-group">
+          <label class="form-label">👤 Full Name</label>
+          <input name="name" class="form-input" required placeholder="Enter participant's full name">
+        </div>
+        <div class="form-group">
+          <label class="form-label">📧 Email Address</label>
+          <input type="email" name="email" class="form-input" required placeholder="participant@email.com">
+        </div>
+      </div>
+
+      <div class="participant-fields" style="grid-template-columns: 1fr 1fr;">
+        <div class="form-group">
+          <label class="form-label">📅 Start Date & Time</label>
+          <input type="datetime-local" name="start_time" class="form-input" required>
+        </div>
+        <div class="form-group">
+          <label class="form-label">🕐 End Date & Time</label>
+          <input type="datetime-local" name="end_time" class="form-input" required>
+        </div>
+      </div>
+
+      <div class="batch-actions">
+        <button type="submit" class="btn-primary btn-success">
+          📆 Create Calendar Event & Send Invite
+        </button>
+        <p style="margin: 15px 0 0; color: #4a5568; font-size: 0.95em;">
+          📧 Google Calendar invite will be sent automatically to the participant
+        </p>
+      </div>
+    </form>
+  </div>
+</div>
+
 <!-- Add Participants Section -->
 <div class="section" id="add-participants">
-  <h2 class="section-title">👥 Add New Participants</h2>
+  <h2 class="section-title">👥 Add Participants (Send Booking Link)</h2>
+  <p style="color: #4a5568; margin-bottom: 20px;">Send participants a booking link to let them choose their preferred time slots</p>
 
   <div class="participant-form">
     <form method="post" action="/admin/participants/batch" id="participantForm">
@@ -1538,6 +1588,14 @@ def admin():
         success = "Booking not found or not confirmed."
     elif msg == "removal_failed":
         success = "Failed to remove booking. Please try again."
+    elif msg == "direct_booking_success":
+        success = "Participant booked successfully! Google Calendar invite has been sent."
+    elif msg == "direct_booking_failed":
+        success = "Failed to create booking. Please try again."
+    elif msg == "missing_fields":
+        success = "Please fill in all required fields."
+    elif msg == "invalid_time_range":
+        success = "End time must be after start time."
 
     # Get pending bookings with formatted times
     pending_bookings = []
@@ -1992,6 +2050,18 @@ def admin_calendar():
                         'calendar_event_id': calendar_event_id
                     })
 
+    # Fetch busy blocks for entire week with ONE API call
+    busy_blocks = []
+    if calendar_available:
+        try:
+            week_start_utc = to_iso_utc(week_start)
+            week_end_utc = to_iso_utc(week_end)
+            busy_blocks = freebusy_blocks(service, week_start_utc, week_end_utc)
+            print(f"[ADMIN CALENDAR] Fetched {len(busy_blocks)} busy blocks for the week")
+        except Exception as e:
+            print(f"[ADMIN CALENDAR] Error fetching busy blocks: {e}")
+            calendar_available = False
+
     # Generate calendar data (similar to invite function but with booking info)
     calendar_days = []
     for d in range(7):
@@ -2021,6 +2091,15 @@ def admin_calendar():
                     is_blocked = True
                     break
 
+            # Check if slot is busy in Google Calendar (from cached busy_blocks)
+            is_calendar_busy = False
+            for busy in busy_blocks:
+                busy_start = parse_iso(busy["start"]).astimezone(TZ)
+                busy_end = parse_iso(busy["end"]).astimezone(TZ)
+                if not (end <= busy_start or start >= busy_end):
+                    is_calendar_busy = True
+                    break
+
             # Determine slot status
             if start <= now_local:
                 status = "past"
@@ -2030,10 +2109,10 @@ def admin_calendar():
                 status = "blocked"
             elif not calendar_available:
                 status = "unavailable"
-            elif is_free(service, start, end):
-                status = "available"
-            else:
+            elif is_calendar_busy:
                 status = "unavailable"
+            else:
+                status = "available"
 
             day_slots.append({
                 "status": status,
@@ -2608,6 +2687,92 @@ def admin_participants_batch():
     """
 
     return results_html
+
+@app.post("/admin/direct-booking")
+@require_auth
+def admin_direct_booking():
+    """Directly book a participant with calendar invite (no preference selection)"""
+    name = request.form.get("name", "").strip()
+    email = request.form.get("email", "").strip().lower()
+    start_time_str = request.form.get("start_time", "")
+    end_time_str = request.form.get("end_time", "")
+
+    if not name or not email or not start_time_str or not end_time_str:
+        return redirect(url_for("admin") + "?msg=missing_fields")
+
+    try:
+        # Parse datetime-local format (YYYY-MM-DDTHH:MM) and localize to Toronto timezone
+        start_dt = datetime.strptime(start_time_str, "%Y-%m-%dT%H:%M").replace(tzinfo=TZ)
+        end_dt = datetime.strptime(end_time_str, "%Y-%m-%dT%H:%M").replace(tzinfo=TZ)
+
+        # Validate times
+        if end_dt <= start_dt:
+            return redirect(url_for("admin") + "?msg=invalid_time_range")
+
+        # Create participant and booking
+        token = secrets.token_urlsafe(16)
+        with db() as con:
+            # Create participant
+            con.execute("INSERT INTO participants(name,email,token) VALUES(?,?,?)", (name, email, token))
+            participant_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+            # Create confirmed booking
+            con.execute("""
+                INSERT INTO bookings(
+                    participant_id,
+                    preference1_start, preference1_end,
+                    selected_start_time, selected_end_time,
+                    status, admin_confirmed_at
+                ) VALUES(?,?,?,?,?,'confirmed',CURRENT_TIMESTAMP)
+            """, (participant_id, start_dt.isoformat(), end_dt.isoformat(),
+                  start_dt.isoformat(), end_dt.isoformat()))
+            booking_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        # Create Google Calendar event
+        svc = calendar_service()
+        event = {
+            "summary": f"User Study — {name}",
+            "description": f"Participant: {name} <{email}>\nConsent: {HOST_BASE}/consent\n\nStatus: BOOKED by Admin (Direct Booking)",
+            "start": {"dateTime": to_iso_utc(start_dt), "timeZone": "UTC"},
+            "end":   {"dateTime": to_iso_utc(end_dt),   "timeZone": "UTC"},
+            "attendees": [{"email": email}],
+        }
+
+        # Try configured calendar first, fallback to primary
+        calendar_id_to_use = CALENDAR_ID or "primary"
+        try:
+            created = svc.events().insert(
+                calendarId=calendar_id_to_use,
+                body=event,
+                sendUpdates="all"
+            ).execute()
+            print(f"[DIRECT BOOKING] Calendar event created: {created.get('id')}")
+        except Exception as calendar_error:
+            if calendar_id_to_use != "primary":
+                print(f"[DIRECT BOOKING] Failed on configured calendar, trying primary")
+                created = svc.events().insert(
+                    calendarId="primary",
+                    body=event,
+                    sendUpdates="all"
+                ).execute()
+                print(f"[DIRECT BOOKING] Calendar event created on primary: {created.get('id')}")
+            else:
+                raise calendar_error
+
+        # Update booking with calendar event ID
+        with db() as con:
+            con.execute("""
+                UPDATE bookings SET calendar_event_id = ? WHERE id = ?
+            """, (created['id'], booking_id))
+
+        print(f"[DIRECT BOOKING] Successfully booked {name} ({email}) for {start_dt} - {end_dt}")
+        return redirect(url_for("admin") + "?msg=direct_booking_success")
+
+    except Exception as e:
+        import traceback
+        print(f"[DIRECT BOOKING ERROR] {e}")
+        print(f"[DIRECT BOOKING TRACEBACK] {traceback.format_exc()}")
+        return redirect(url_for("admin") + "?msg=direct_booking_failed")
 
 @app.post("/admin/block-slot")
 @require_auth
